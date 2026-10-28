@@ -20,8 +20,8 @@ Long (short is the mirror image):
      Optionally, the RBR's base must start within `max_pause_candles` candles of
      the break of structure.
   7. Target (when price comes back to the RBR): `target_fraction` (80%) of the
-     way to the nearest fresh H1 or H4 supply zone above (one price hasn't come
-     back to since it formed); if there is none, the
+     way to the nearest unbroken H1 supply zone above (touched is fine); if
+     there is none, the
      RBR's move-out distance (top of the RBR to the high before the return)
      projected from the entry. Under `min_reward_risk`, no trade.
 
@@ -107,17 +107,6 @@ def find_setups(h1, cfg=None, pip=0.0001):
     return pd.DataFrame(rows)
 
 
-def first_touch(zones, bars):
-    """When price first came back to each zone's entry edge after it became available (NaT: never)."""
-    times, high, low = bars["time"], bars["high"].to_numpy(), bars["low"].to_numpy()
-    touched = []
-    for z in zones.itertuples(index=False):
-        start = int(times.searchsorted(z.available_time)) if pd.notna(z.available_time) else len(bars)
-        hit = np.flatnonzero(high[start:] >= z.bottom if z.kind == "supply" else low[start:] <= z.top)
-        touched.append(times.iat[start + hit[0]] if len(hit) else pd.NaT)
-    return pd.Series(touched, index=zones.index, dtype=times.dtype)
-
-
 def simulate(setups, market, cfg, pip):
     """Trade each setup once: fill, target at the return, exit. R is in units of the full risk."""
     bars, times = market.bars, market.bars["time"]
@@ -127,8 +116,7 @@ def simulate(setups, market, cfg, pip):
     ask = {"open": o + half, "high": h + half, "low": l + half, "close": c + half}
     daily_atr = pd.merge_asof(bars[["time"]], market.d1_atr.sort_values("available_time"),
                               left_on="time", right_on="available_time")["atr"].to_numpy()
-    zones = market.all_zones[market.all_zones["tf"].isin(["H1", "H4"])]
-    touched = first_touch(zones, bars)
+    h1_zones = market.all_zones[market.all_zones["tf"] == "H1"]
     d1, h4 = state_at_bars(bars, market.d1, ["trend"])["trend"], state_at_bars(bars, market.h4, ["trend"])["trend"]
     out = []
     for s in setups.itertuples(index=False):
@@ -155,8 +143,7 @@ def simulate(setups, market, cfg, pip):
             continue
         f += order
         t = times.iat[f]
-        opp = active_at(zones, t)
-        opp = opp[~(touched[opp.index] < t)]  # fresh: not touched before the entry candle
+        opp = active_at(h1_zones, t)
         if long:
             edges = opp.loc[(opp["kind"] == "supply") & (opp["bottom"] > entry), "bottom"]
         else:
