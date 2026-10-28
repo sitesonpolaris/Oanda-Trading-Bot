@@ -2,7 +2,7 @@
 
 Automated Forex trading bot for the **OANDA practice (fxTrade Practice) account only**.
 
-Current stage: **data feed, zone detection, market structure, backtest** — no live trading or order code yet.
+Current stage: **data feed, zone detection, market structure, backtest, risk manager** — no live trading or order code yet.
 
 ## Setup
 
@@ -123,6 +123,39 @@ Output in `output/backtest/`: `trades_<instrument>_<tf>_m<multiple>_b<buffer>.cs
 and `<instrument>_H4_structure.csv` (trend and BOS per H4 candle).
 
 Options: `--spread 1.0`, `--risk 0.005`, `--zones-tf H1`, `--in-sample-months 18`.
+
+## Risk manager (`risk_manager.py`)
+
+Every signal must pass `RiskManager.evaluate(signal, account)` before an order
+can be placed. It returns an approved order with a position size, or a
+rejection with a reason. It never talks to the broker.
+
+- **Sizing:** a stop-out loses `risk_per_trade_pct` of current balance (default 0.5%).
+- **Limits** (all in `RiskLimits`): max daily loss, max total drawdown from the
+  starting balance, max open positions, cap on total open risk.
+- **Safety margin:** the bot halts `safety_margin_pct` points *before* the firm's
+  limits (5% daily → halts at 4%). It also rejects any trade whose stop, plus
+  every open stop, would cross a halt line.
+- **Halt:** when a daily or total limit is hit, every new signal is rejected.
+  The halt is saved to `state/risk_state.json` and survives restarts until
+  reset by hand:
+
+```bash
+python risk_manager.py status
+```
+
+```bash
+python risk_manager.py reset
+```
+
+- **Scaling in:** up to 3 entries per setup (`setup_id`). Each extra entry needs
+  a favourable break of structure after the previous entry, and all entries on
+  the setup together may not risk more than `risk_per_trade_pct`. A scale-in is
+  sized down to whatever risk room is left (usually created by moving earlier
+  stops to breakeven).
+
+**The prop firm values in `RiskLimits` are placeholders (5% daily, 10% total)
+until the real challenge rules are filled in.**
 
 ## Tests
 
