@@ -268,3 +268,18 @@ class Executioner:
             return False
         log.info("Cancelled %s (%s)", pending.client_id, reason)
         return True
+
+    def set_take_profit(self, trade, price, reason):
+        """Replace an open trade's take profit. Safe to repeat: it just sets the same price again."""
+        price_text = price_str(trade.instrument, price)
+        if self.dry_run:
+            log.info("[DRY RUN] would set take profit on trade %s to %s (%s)", trade.trade_id, price_text, reason)
+            return True
+        data = {"takeProfit": {"price": price_text, "timeInForce": "GTC"}}
+        try:
+            self._request(trades.TradeCRCDO(self.account_id, trade.trade_id, data=data))
+        except V20Error as e:
+            log.error("Setting take profit on trade %s failed: HTTP %s %s", trade.trade_id, e.code, e.msg)
+            return False
+        log.info("Set take profit on trade %s to %s (%s)", trade.trade_id, price_text, reason)
+        return True

@@ -71,8 +71,8 @@ def test_rally_candle_must_close_in_top_quarter():
     assert len(zones(history() + [RALLY_IN, BASE_A, weak_close], loose)) == 1
 
 
-def test_rally_candle_must_be_green():
-    red = (1.1065, 1.1066, 1.1006, 1.1063)  # closes above the base high, but below its own open
+def test_red_candle_closing_near_its_high_is_a_basing_candle_not_a_rally():
+    red = (1.1066, 1.1068, 1.1006, 1.1064)  # closes in its top 25%, but its body is tiny
     assert zones(history() + [RALLY_IN, BASE_A, red]).empty
 
 
@@ -104,6 +104,18 @@ def test_basing_candles_have_small_bodies_and_number_one_to_five():
     assert zones(history() + [RALLY_IN] + [BASE_A, BASE_B] * 2 + [BASE_A, RALLY_OUT]).iloc[0].base_candles == 5
     assert zones(history() + [RALLY_IN] + [BASE_A, BASE_B] * 3 + [RALLY_OUT]).empty  # 6: disqualified
     assert zones(history() + [RALLY_IN, RALLY_OUT]).empty  # no base
+
+
+def test_zone_valid_only_after_moving_away_twice_its_height():
+    # Base 1.0995-1.1006 (11 pips): price must reach 1.1006 + 22 pips = 1.1028 before the zone is valid.
+    short_move = (1.1000, 1.1025, 1.0998, 1.1024)  # strong move-out, but only 19 pips above the zone
+    further = (1.1024, 1.1030, 1.1020, 1.1028)
+    df = frame(history() + [RALLY_IN, BASE_A, short_move])
+    assert pd.isna(detect_zones(df, NO_BREAKOUT).iloc[0].valid_time)
+    df = frame(history() + [RALLY_IN, BASE_A, short_move, further])
+    assert detect_zones(df, NO_BREAKOUT).iloc[0].valid_time == df["time"].iloc[-1]
+    back = (1.1024, 1.1026, 1.1005, 1.1010)  # returns to the zone before the move away is complete
+    assert detect_zones(frame(history() + [RALLY_IN, BASE_A, short_move, back, further]), NO_BREAKOUT).empty
 
 
 def test_optional_average_range_multiple():

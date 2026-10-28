@@ -12,15 +12,20 @@ NOW = datetime(2026, 5, 5, 12, tzinfo=timezone.utc)
 class StubExecutioner:
     def __init__(self):
         self.cancelled = []
+        self.take_profits = []
 
     def cancel(self, order, reason):
         self.cancelled.append((order.setup_id, reason))
         return True
 
+    def set_take_profit(self, trade, price, reason):
+        self.take_profits.append((trade.trade_id, price))
+        return True
+
 
 def bot():
     b = Bot.__new__(Bot)
-    b.cfg, b.ex = BotConfig(max_order_age_candles=24), StubExecutioner()
+    b.cfg, b.ex, b.pip = BotConfig(max_order_age_candles=24), StubExecutioner(), 0.0001
     return b
 
 
@@ -54,3 +59,17 @@ def test_closed_by_drops_candles_still_forming():
     t = pd.date_range("2026-05-05 00:00", periods=4, freq="4h", tz="UTC")
     df = pd.DataFrame({"time": t})
     assert list(closed_by(df, "H4", pd.Timestamp("2026-05-05 13:00", tz="UTC"))["time"]) == list(t[:3])
+
+
+def test_every_entry_on_a_setup_gets_the_target_as_of_the_first_fill(monkeypatch):
+    import bot as bot_module
+    from executioner import OpenTrade
+    b = bot()
+    first = OpenTrade("1", "s", "EUR_USD", 30_000, 1.1000, 1.0983, NOW - timedelta(hours=5), 0.0, 1.1050)
+    add = OpenTrade("2", "s", "EUR_USD", 30_000, 1.1020, 1.0983, NOW - timedelta(hours=1), 0.0, 1.1050)
+    seen = []
+    monkeypatch.setattr(bot_module, "target_for_trade", lambda t, m: seen.append(t.trade_id) or 1.1045)
+    book = Book([])
+    book.trades = [add, first]
+    b.update_targets(book, market=None)
+    assert seen == ["1"] and b.ex.take_profits == [("2", 1.1045), ("1", 1.1045)]

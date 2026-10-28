@@ -21,6 +21,7 @@ class FakeOanda:
         self.create_failures = list(create_failures)
         self.create_lands_anyway = create_lands_anyway
         self.cancelled = []
+        self.take_profits = []
 
     def request(self, endpoint):
         path, method = str(endpoint), endpoint.method
@@ -39,6 +40,9 @@ class FakeOanda:
             return {"order": self.orders[cid]}
         if method == "PUT" and path.endswith("/cancel"):
             self.cancelled.append(path.split("/")[-2])
+            return {}
+        if method == "PUT" and "/trades/" in path and path.endswith("/orders"):
+            self.take_profits.append((path.split("/")[-2], endpoint.data["takeProfit"]["price"]))
             return {}
         raise AssertionError(f"unexpected request {method} {path}")
 
@@ -145,3 +149,12 @@ def test_cancel_and_dry_run_cancel():
     assert ex(oanda).cancel(pending(), "expired") and oanda.cancelled == ["42"]
     oanda = FakeOanda()
     assert ex(oanda, dry_run=True).cancel(pending(), "expired") and oanda.cancelled == []
+
+
+def test_set_take_profit_on_open_trade():
+    from executioner import OpenTrade
+    trade = OpenTrade("77", "z", "EUR_USD", 30_000, 1.1000, 1.0983, datetime(2026, 5, 4, tzinfo=timezone.utc), 0.0, 1.1050)
+    oanda = FakeOanda()
+    assert ex(oanda).set_take_profit(trade, 1.10453, "test") and oanda.take_profits == [("77", "1.10453")]
+    oanda = FakeOanda()
+    assert ex(oanda, dry_run=True).set_take_profit(trade, 1.10453, "test") and oanda.take_profits == []

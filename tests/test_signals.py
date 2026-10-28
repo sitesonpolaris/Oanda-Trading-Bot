@@ -1,11 +1,12 @@
 from datetime import timedelta
 
 import pandas as pd
+import pytest
 
 from backtest import BacktestConfig
 from executioner import OpenTrade
-from helpers import SETUP, SUPPLY_ABOVE, T0, TOUCH, bars, market, zone
-from signals import add_signals, evaluate_zones
+from helpers import SETUP, SUPPLY_ABOVE, T0, TOUCH, bars, market, pivot, zone
+from signals import add_signals, evaluate_zones, target_for_trade
 
 PIP = 0.0001
 CFG = BacktestConfig()
@@ -23,13 +24,14 @@ def verdict(rows, **kw):
 def test_fresh_confirmed_trend_aligned_zone_is_a_signal():
     v = verdict(SETUP)
     assert v.status == "signal" and v.signal.order_type == "LIMIT"
-    assert (v.signal.entry, round(v.signal.target, 5)) == (1.1000, 1.1040)
+    assert (v.signal.entry, v.signal.stop, v.signal.target) == (1.1000, pytest.approx(1.0983), 1.1050)
     assert v.setup_id == "EUR_USD-H1-202601050900"
 
 
 def test_touched_and_unconfirmed_and_trend_verdicts():
     assert verdict(SETUP + [TOUCH]).status == "touched"
-    assert verdict(SETUP, zones=[]).status == "no_opposing_zone"
+    assert verdict(SETUP, zones=[]).status == "no_target"
+    assert verdict(SETUP, pivots=[pivot("high", 1.1020)]).status == "skipped_rr"
     assert verdict(SETUP, h4_trend="down").status == "skipped_trend"
 
 
@@ -64,6 +66,14 @@ def test_live_momentum_check_uses_zone_formation_time():
 def test_waits_for_breakout_and_skips_untraded_types():
     b = bars(SETUP)
     m = market(b)
-    waiting = evaluate_zones(pd.DataFrame([zone(breakout_time=pd.NaT)]), m, CFG, PIP, now_after(b))[0]
-    assert waiting.status == "waiting_breakout"
-    assert evaluate_zones(pd.DataFrame([zone(type="DBR")]), m, CFG, PIP, now_after(b)) == []
+    waiting = evaluate_zones(pd.DataFrame([zone(valid_time=pd.NaT)]), m, CFG, PIP, now_after(b))[0]
+    assert waiting.status == "waiting_validation" and "2x move away" in waiting.detail
+    only = BacktestConfig(trade_types=("RBR", "DBD"))
+    assert evaluate_zones(pd.DataFrame([zone(type="DBR")]), m, only, PIP, now_after(b)) == []
+
+
+def test_filled_trade_target_is_set_as_of_the_fill():
+    b = bars(SETUP)
+    trade = OpenTrade("7", "EUR_USD-H1-x", "EUR_USD", 30_000, 1.1000, 1.0983, T0 + timedelta(hours=7), 0.0, 1.1050)
+    pivots = [pivot("high", 1.1045, T0 + timedelta(hours=6)), pivot("high", 1.1030, T0 + timedelta(hours=9))]
+    assert target_for_trade(trade, market(b, pivots=pivots)) == 1.1045  # the 1.1030 pivot came after the fill

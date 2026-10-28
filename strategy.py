@@ -1,24 +1,23 @@
-"""Strategy rules from the spec, shared by the backtest and the live bot.
+"""Strategy rules, shared by the backtest and the live bot. They follow the TWP
+Market Structure course where it's specific, and the strategy spec elsewhere.
 
-Timeframes: trend on D1, momentum on H4, zones and entries on H1.
+Timeframes: trend (stage) on D1, momentum on H4, zones and entries on H1.
 
 For a demand zone (supply is the mirror image):
-  1. Zones: valid course zones (zones.py), traded types `trade_types` (RBR for
-     longs, DBD for shorts by default).
-  2. Plan, fixed when the zone becomes valid (the breakout candle closes), and
-     the limit order goes in right away:
-     - entry at the top of the demand zone
-     - stop below the zone's far edge minus `atr_buffer` x ATR
-     - target `target_fraction` (80%) of the way from the entry to the bottom of
-       the next supply zone above (nearest active H1 or H4 strong zone). No
-       opposing zone, no trade.
-  3. Filters, checked when price comes back to the zone:
-     - reward:risk at least `min_reward_risk`
-     - direction: H4 momentum was up when the zone became valid, and the D1 trend is
-       up when price returns; or, countertrend, the D1 trend has been
-       neutralised by a bullish D1 break of structure. Momentum is checked at
-       formation, not at the return, because price must pull back against the
-       trade to reach the zone, which turns momentum.
+  1. Zones: valid course zones (zones.py), all four types by default.
+  2. The limit order goes in when the zone becomes valid (breakout and move away
+     done):
+     - entry at the zone's entry edge (top of a demand zone)
+     - stop below the zone's far edge by `atr_buffer` x the daily ATR
+       (course: 10% of the daily ATR for trades on 30-minute charts and above)
+  3. When price comes back to the zone:
+     - target: the nearer of the prior pivot high (most recent confirmed H1
+       swing high above the entry) and the bottom of the nearest active
+       supply zone above (course: "target at prior pivot high/low or opposing
+       zone"). Neither, no trade.
+     - reward:risk at least `min_reward_risk` (2:1)
+     - direction: D1 trend up (Stage 2) and H4 momentum up when the zone became
+       valid; all timeframes must align (countertrend off by default)
      - no high-impact news for either currency inside the news window
      - market not erratic: fewer than `max_big_wicks` of the last `wick_lookback`
        H1 candles have wicks of at least `wick_atr` x ATR
@@ -40,30 +39,59 @@ NEVER = pd.Timestamp.max.tz_localize("UTC")
 
 @dataclass
 class StrategyConfig:
-    trade_types: tuple = ("RBR", "DBD")
-    atr_buffer: float = 0.1
-    target_fraction: float = 0.8
+    trade_types: tuple = ("RBR", "DBR", "DBD", "RBD")
+    atr_buffer: float = 0.1          # stop buffer as a fraction of the daily ATR
     min_reward_risk: float = 2.0
     wick_lookback: int = 20
     wick_atr: float = 1.0
     max_big_wicks: int = 5
     news_before_min: int = 30
     news_after_min: int = 30
-    allow_countertrend_with_bos: bool = True
+    allow_countertrend_with_bos: bool = False
     initial_fraction: float = 1 / 3
     add_fraction: float = 1 / 3
     max_adds: int = 2
     lol_tolerance_atr: float = 0.5
 
 
-def plan_trade(zone, opposing_edge, cfg, pip):
-    """Entry, stop and target: target is `target_fraction` of the way from entry to the opposing zone."""
-    buffer = cfg.atr_buffer * zone.atr_pips * pip
+def entry_stop(zone, daily_atr, cfg):
+    """Entry at the zone's entry edge, stop beyond the far edge by `atr_buffer` x the daily ATR."""
+    buffer = cfg.atr_buffer * daily_atr
     if zone.kind == "demand":
-        entry = zone.top
-        return entry, zone.bottom - buffer, entry + cfg.target_fraction * (opposing_edge - entry)
-    entry = zone.bottom
-    return entry, zone.top + buffer, entry - cfg.target_fraction * (entry - opposing_edge)
+        return zone.top, zone.bottom - buffer
+    return zone.bottom, zone.top + buffer
+
+
+def prior_pivot(long, entry, t, pivots):
+    """Most recent swing high above the entry (long) / swing low below it (short) confirmed by t."""
+    known = pivots[pivots["confirmed_time"] <= t]
+    if long:
+        levels = known.loc[(known["kind"] == "high") & (known["level"] > entry), "level"]
+    else:
+        levels = known.loc[(known["kind"] == "low") & (known["level"] < entry), "level"]
+    return levels.iloc[-1] if len(levels) else None
+
+
+def trade_target(long, entry, t, all_zones, pivots):
+    """(target, source): the nearer of the prior pivot and the opposing zone's edge, or (None, '')."""
+    candidates = [(p, "pivot") for p in [prior_pivot(long, entry, t, pivots)] if p is not None]
+    candidates += [(e, "zone") for e in [opposing_edge(long, entry, t, all_zones)] if e is not None]
+    if not candidates:
+        return None, ""
+    return min(candidates) if long else max(candidates)
+
+
+def h1_pivots(structure, tf_delta, strength):
+    """Swing levels with the time they were confirmed (close of the `strength`-th candle after)."""
+    times = structure["time"]
+    rows = []
+    for kind, flag, col in (("high", "swing_high", "last_swing_high"), ("low", "swing_low", "last_swing_low")):
+        for j in structure.index[structure[flag]]:
+            if j + strength < len(structure):
+                rows.append({"kind": kind, "level": structure[col].iat[j + strength],
+                             "confirmed_time": times.iat[j + strength] + tf_delta})
+    out = pd.DataFrame(rows, columns=["kind", "level", "confirmed_time"])
+    return out.sort_values("confirmed_time").reset_index(drop=True)
 
 
 def opposing_edge(long, entry, t, all_zones):
@@ -93,10 +121,10 @@ def direction_check(long, d1_trend, d1_last_bos, h4_at_formation, cfg):
 
 
 def zone_lifecycle(zones, candles, tf_delta):
-    """Add available_time (breakout candle closed; NaT if no breakout yet) and broken_time (first
-    close beyond the far edge after that)."""
+    """Add available_time (the zone became valid; NaT if not yet) and broken_time (first close
+    beyond the far edge after that)."""
     out = zones.copy()
-    out["available_time"] = out["breakout_time"] + tf_delta
+    out["available_time"] = out["valid_time"] + tf_delta
     closes = candles["close"].to_numpy()
     broken = []
     for z in out.itertuples(index=False):

@@ -2,6 +2,8 @@ import pandas as pd
 
 from structure import StructureConfig, find_swings, market_structure
 
+SWINGS_ONLY = StructureConfig(stage_mas=None)
+
 
 def frame(closes):
     """Candles with a 2-pip wick either side of a 1-pip body ending at each close."""
@@ -26,17 +28,17 @@ def test_swings_are_local_extremes():
 
 
 def test_rising_highs_and_lows_is_uptrend():
-    s = market_structure(frame(zigzag([1.10, 1.12, 1.11, 1.13, 1.12, 1.14, 1.13, 1.15])))
+    s = market_structure(frame(zigzag([1.10, 1.12, 1.11, 1.13, 1.12, 1.14, 1.13, 1.15])), SWINGS_ONLY)
     assert s["trend"].iloc[-1] == "up"
 
 
 def test_falling_highs_and_lows_is_downtrend():
-    s = market_structure(frame(zigzag([1.15, 1.13, 1.14, 1.12, 1.13, 1.11, 1.12, 1.10])))
+    s = market_structure(frame(zigzag([1.15, 1.13, 1.14, 1.12, 1.13, 1.11, 1.12, 1.10])), SWINGS_ONLY)
     assert s["trend"].iloc[-1] == "down"
 
 
 def test_mixed_swings_is_sideways():
-    s = market_structure(frame(zigzag([1.10, 1.13, 1.11, 1.12, 1.12, 1.14, 1.10, 1.115])))
+    s = market_structure(frame(zigzag([1.10, 1.13, 1.11, 1.12, 1.12, 1.14, 1.10, 1.115])), SWINGS_ONLY)
     assert s["trend"].iloc[-1] == "sideways"
 
 
@@ -52,8 +54,8 @@ def test_bullish_bos_when_close_breaks_last_swing_high():
 def test_opposite_bos_neutralises_trend():
     # Higher highs and lows, then a close below the last swing low (1.125) before a new swing forms.
     up_then_break = zigzag([1.10, 1.12, 1.11, 1.13, 1.12, 1.14, 1.125, 1.145, 1.12])
-    assert market_structure(frame(up_then_break))["trend"].iloc[-1] == "sideways"
-    kept = market_structure(frame(up_then_break), StructureConfig(bos_invalidates_trend=False))
+    assert market_structure(frame(up_then_break), SWINGS_ONLY)["trend"].iloc[-1] == "sideways"
+    kept = market_structure(frame(up_then_break), StructureConfig(bos_invalidates_trend=False, stage_mas=None))
     assert kept["trend"].iloc[-1] == "up"
 
 
@@ -62,3 +64,16 @@ def test_swing_not_known_before_confirmation():
     s = market_structure(df)
     assert pd.isna(s["last_swing_high"].iloc[5])  # swing at 4 needs candles 5 and 6
     assert s["last_swing_high"].iloc[6] == df["high"].iloc[4]
+
+
+def test_stage_2_needs_rising_20_and_40_period_averages():
+    rising = [1.10 + 0.01 * (k // 2) + (0.02 if k % 2 else 0) for k in range(14)]  # 1.10, 1.12, 1.11, 1.13, ...
+    s = market_structure(frame(zigzag(rising)))
+    assert len(s) > 45 and s["trend"].iloc[-1] == "up"
+
+
+def test_higher_highs_with_falling_averages_is_not_stage_2():
+    decline = [1.40 - 0.0075 * k for k in range(41)]  # steep slide keeps the 40-period average falling
+    df = frame(decline + zigzag([1.10, 1.12, 1.11, 1.13, 1.12, 1.14, 1.13, 1.15]))
+    assert market_structure(df, SWINGS_ONLY)["trend"].iloc[-1] == "up"
+    assert market_structure(df)["trend"].iloc[-1] == "sideways"

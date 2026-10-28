@@ -1,8 +1,9 @@
 """Hand-built H1 market for strategy, backtest and signal tests.
 
-Demand zone 1.0990-1.1000 (ATR 10 pips), leg-out (and breakout) at bar 2, so the
-limit order goes in at bar 3. The default opposing supply zone starts at 1.1050, so the plan is:
-entry 1.1000, stop 1.0989, target 1.1000 + 0.8 x 50 pips = 1.1040 (3.64R).
+Demand zone 1.0990-1.1000, valid at the leg-out (bar 2), so the limit order goes
+in at bar 3. Daily ATR 70 pips gives a 7-pip stop buffer. With no pivots, the
+default opposing supply zone (bottom 1.1050) is the target:
+entry 1.1000, stop 1.0983, target 1.1050 (50 pips vs 17: 2.94R).
 Bars 3-6 stay above the zone, bar 7 touches it, bar 8 reaches the target.
 """
 
@@ -18,7 +19,7 @@ DIP1 = (1.1045, 1.1046, 1.1030, 1.1035)
 DIP2 = (1.1035, 1.1040, 1.1020, 1.1025)
 AWAY = (1.1025, 1.1030, 1.1015, 1.1020)
 TOUCH = (1.1010, 1.1012, 1.0995, 1.1005)
-WIN = (1.1010, 1.1045, 1.1005, 1.1040)
+WIN = (1.1010, 1.1055, 1.1005, 1.1050)
 LOSS = (1.1000, 1.1002, 1.0980, 1.0985)
 SETUP = [LEAD, LEAD, LEGOUT, PEAK, DIP1, DIP2, AWAY]
 
@@ -31,7 +32,8 @@ def bars(rows):
 def zone(kind="demand", top=1.1000, bottom=1.0990, start=None, legout_bar=2, **extra):
     start = start if start is not None else T0 + pd.Timedelta(hours=legout_bar - 1)
     legout = T0 + pd.Timedelta(hours=legout_bar)
-    return {"start_time": start, "legout_time": legout, "breakout_time": legout, "breakout_level": top + 0.0010,
+    return {"start_time": start, "legout_time": legout, "breakout_time": legout, "valid_time": legout,
+            "breakout_level": top + 0.0010,
             "type": "RBR" if
             kind == "demand" else "DBD", "kind": kind, "top": top, "bottom": bottom, "base_candles": 1,
             "impulse_pips": 30, "impulse_ratio": 3.0, "impulse_atr": 3.0, "atr_pips": 10, **extra}
@@ -46,7 +48,12 @@ def lifecycle_zone(kind, top, bottom, available=T0 - pd.Timedelta(hours=1), brok
 SUPPLY_ABOVE = lifecycle_zone("supply", top=1.1060, bottom=1.1050)  # default opposing zone for demand trades
 
 
-def market(b, d1_trend="up", d1_bos="", h4_trend="up", h1_bos=None, zones=None, news=None):
+def pivot(kind, level, confirmed=T0 - pd.Timedelta(hours=1)):
+    return {"kind": kind, "level": level, "confirmed_time": confirmed}
+
+
+def market(b, d1_trend="up", d1_bos="", h4_trend="up", h1_bos=None, zones=None, news=None, pivots=(),
+           daily_atr=0.0070):
     state = pd.DataFrame({"available_time": [T0 - pd.Timedelta(days=1)]})
     return Market(
         bars=b,
@@ -58,5 +65,7 @@ def market(b, d1_trend="up", d1_bos="", h4_trend="up", h1_bos=None, zones=None, 
                                columns=["start_time", "kind", "top", "bottom", "available_time", "broken_time"]),
         news=news,
         instrument="EUR_USD",
+        pivots=pd.DataFrame(list(pivots), columns=["kind", "level", "confirmed_time"]),
+        d1_atr=state.assign(atr=daily_atr),
     )
 

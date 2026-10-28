@@ -1,11 +1,11 @@
 """Backtest the strategy spec on the in-sample period only.
 
-Rules (see strategy.py): course zones on H1 (RBR / DBD traded), D1 trend + H4
-momentum at the breakout, limit entry at the zone's near edge as soon as the
-breakout candle closes, stop
-beyond the far edge + ATR buffer, target 80% of the way to the next opposing
-zone, erratic-wick and news filters, a one-third first entry with up to two
-one-third adds on H1 breaks of structure in the trade's favour.
+Rules (see strategy.py): course zones on H1 (all four types), D1 stage + H4
+momentum aligned, limit entry at the zone's entry edge once the zone is valid,
+stop beyond the far edge + 10% of the daily ATR, target at the nearer of the
+prior pivot and the opposing zone (2:1 minimum), erratic-wick and news filters,
+a one-third first entry with up to two one-third adds on H1 breaks of structure
+in the trade's favour.
 
 Execution is simulated on H1 mid candles with a fixed spread: buys fill and exit
 on the ask/bid side, so every entry, add and exit pays it. When one candle hits
@@ -21,7 +21,7 @@ Usage:
     python backtest.py --start 2024-10-28                     # the original 18-month window
     python backtest.py --instruments GBP_USD AUD_USD USD_JPY  # other pairs
 
-The grid runs ATR buffer 0.1 / 0.2 / 0.25 against the optional impulse strength
+The grid runs the stop buffer (0.1 / 0.2 / 0.25 of the daily ATR) against the optional impulse strength
 filter: off (default) / 2x / 2.5x / 3x the recent average range.
 """
 
@@ -34,8 +34,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from strategy import (StrategyConfig, big_wick_counts, direction_check, level_on_level, load_news, news_conflict,
-                      opposing_edge, plan_trade, zone_lifecycle)
+from strategy import (StrategyConfig, big_wick_counts, direction_check, entry_stop, h1_pivots, level_on_level,
+                      load_news, news_conflict, trade_target, zone_lifecycle)
 from structure import StructureConfig, market_structure
 from zones import ZoneConfig, atr, detect_zones, pip_size
 
@@ -65,9 +65,11 @@ class Market:
     d1: pd.DataFrame          # D1 structure (trend, last_bos, available_time)
     h4: pd.DataFrame          # H4 structure (momentum)
     h1: pd.DataFrame          # H1 structure (BOS events for adds), aligned with bars
-    all_zones: pd.DataFrame   # H1 + H4 zones with available/broken times (room, level-on-level)
+    all_zones: pd.DataFrame   # H1 + H4 zones with available/broken times (targets, level-on-level)
     news: pd.DataFrame | None
     instrument: str
+    pivots: pd.DataFrame      # confirmed H1 swing levels (targets)
+    d1_atr: pd.DataFrame      # daily ATR by available_time (stop buffer)
 
 
 def with_available_time(structure, granularity):
@@ -79,14 +81,17 @@ def build_market(h1, h4, d1, zone_cfg, instrument, pip, news=None, structure_cfg
     scfg = structure_cfg or StructureConfig()
     h1_zones = zone_lifecycle(detect_zones(h1, zone_cfg, pip=pip), h1, TIMEFRAMES["H1"]).assign(tf="H1")
     h4_zones = zone_lifecycle(detect_zones(h4, zone_cfg, pip=pip), h4, TIMEFRAMES["H4"]).assign(tf="H4")
+    h1_structure = with_available_time(market_structure(h1, scfg), "H1")
     market = Market(
         bars=h1,
         d1=with_available_time(market_structure(d1, scfg), "D"),
         h4=with_available_time(market_structure(h4, scfg), "H4"),
-        h1=with_available_time(market_structure(h1, scfg), "H1"),
+        h1=h1_structure,
         all_zones=pd.concat([h1_zones, h4_zones], ignore_index=True),
         news=news,
         instrument=instrument,
+        pivots=h1_pivots(h1_structure, TIMEFRAMES["H1"], scfg.swing_strength),
+        d1_atr=pd.DataFrame({"available_time": d1["time"] + TIMEFRAMES["D"], "atr": atr(d1).to_numpy()}),
     )
     return market, h1_zones
 
@@ -134,6 +139,8 @@ def simulate(zones, market, cfg, pip):
     wicks = big_wick_counts(bars, atr_values, cfg)
     d1 = state_at_bars(bars, market.d1, ["trend", "last_bos"])
     h4 = state_at_bars(bars, market.h4, ["trend"])
+    daily_atr = pd.merge_asof(bars[["time"]], market.d1_atr.sort_values("available_time"),
+                              left_on="time", right_on="available_time")["atr"].to_numpy()
     h1_bos = market.h1["bos"].to_numpy()
 
     out = []
@@ -145,26 +152,17 @@ def simulate(zones, market, cfg, pip):
                "level_on_level": level_on_level(z, market.all_zones, z.atr_pips * pip, cfg),
                "zone_top": z.top, "zone_bottom": z.bottom, "status": "", "reason": ""}
         out.append(row)
-        if pd.isna(z.breakout_time):
-            row["status"] = "no_breakout"
+        if pd.isna(z.valid_time):
+            row["status"] = "not_valid"
             continue
-        order = int(times.searchsorted(z.breakout_time)) + 1  # order goes in when the breakout candle closes
-        if order >= len(bars):
+        order = int(times.searchsorted(z.valid_time)) + 1  # order goes in when the zone became valid
+        if order >= len(bars) or np.isnan(daily_atr[order]):
             row["status"] = "untouched"
             continue
-        near = z.top if long else z.bottom
-        edge = opposing_edge(long, near, times.iat[order], market.all_zones)
-        if edge is None:
-            row["status"] = "no_opposing_zone"
-            continue
-        entry, stop, target = plan_trade(z, edge, cfg, pip)
-        risk, reward = abs(entry - stop), (target - entry) * (1 if long else -1)
-        row.update(opposing_edge=edge, order_time=times.iat[order], entry=entry, stop=round(stop, 5),
-                   target=round(target, 5), risk_pips=round(risk / pip, 1), room_pips=round(abs(edge - entry) / pip, 1),
-                   planned_rr=round(reward / risk, 2), spread_r=round(cfg.spread_pips * pip / risk, 3))
-        if reward < cfg.min_reward_risk * risk:
-            row["status"], row["reason"] = "skipped_rr", f"{reward / risk:.2f}R"
-            continue
+        entry, stop = entry_stop(z, daily_atr[order], cfg)
+        risk = abs(entry - stop)
+        row.update(order_time=times.iat[order], entry=entry, stop=round(stop, 5), risk_pips=round(risk / pip, 1),
+                   spread_r=round(cfg.spread_pips * pip / risk, 3))
         touch = ask["low"][order:] <= entry if long else bid["high"][order:] >= entry
         f = first_true(touch)
         if f is None:
@@ -173,6 +171,16 @@ def simulate(zones, market, cfg, pip):
         f += order
         t = times.iat[f]
         row["entry_time"] = t
+
+        target, source = trade_target(long, entry, t, market.all_zones, market.pivots)
+        if target is None:
+            row["status"] = "no_target"
+            continue
+        reward = (target - entry) * (1 if long else -1)
+        row.update(target=round(target, 5), target_source=source, planned_rr=round(reward / risk, 2))
+        if reward < cfg.min_reward_risk * risk:
+            row["status"], row["reason"] = "skipped_rr", f"{reward / risk:.2f}R to the {source}"
+            continue
 
         ok, why = direction_check(long, d1["trend"][f], d1["last_bos"][f], h4["trend"][order], cfg)
         row["reason"] = why
@@ -227,7 +235,7 @@ def summarize(trades, cfg):
         "max_drawdown_%": round(100 * drawdown.max(), 2),
         "avg_adds": round(filled["adds"].mean(), 2) if len(r) and "adds" in filled else 0.0,
         "zones": len(trades),
-        **{s: int(counts.get(s, 0)) for s in ("no_breakout", "no_opposing_zone", "skipped_rr", "skipped_trend",
+        **{s: int(counts.get(s, 0)) for s in ("not_valid", "no_target", "skipped_rr", "skipped_trend",
                                               "skipped_news", "skipped_erratic", "untouched")},
     }
 

@@ -28,7 +28,7 @@ from backtest import TIMEFRAMES, BacktestConfig, build_market, NEWS_PATH
 from executioner import Executioner, RefuseToRun, client_order_id, make_client, resolve_environment
 from fetch_candles import fetch_candles
 from risk_manager import AccountState, Position, RiskLimits, RiskManager
-from signals import add_signals, evaluate_zones
+from signals import add_signals, evaluate_zones, target_for_trade
 from strategy import load_news
 from structure import StructureConfig
 from zones import ZoneConfig, pip_size
@@ -149,6 +149,7 @@ class Bot:
             log.debug("  zone %s %s: %s", v.setup_id, v.status, v.detail)
 
         self.manage_pending(book, {v.setup_id: v for v in verdicts}, now)
+        self.update_targets(book, market)
         self.handle_signals([v for v in verdicts if v.status == "signal"], book, account)
         self.handle_adds(add_signals(book.trades, market, cfg.trade, now), account)
 
@@ -162,6 +163,21 @@ class Bot:
                 self.ex.cancel(o, f"unfilled after {self.cfg.max_order_age_candles} H1 candles")
             else:
                 log.info("Keeping %s: zone still valid, age %s", o.client_id, now - o.created)
+
+    def update_targets(self, book, market):
+        """Give every entry on a setup the target the rules set as of the setup's first fill."""
+        setups = {}
+        for t in book.trades:
+            if t.setup_id != "manual" and t.target is not None:
+                setups.setdefault(t.setup_id, []).append(t)
+        for setup, entries in setups.items():
+            target = target_for_trade(min(entries, key=lambda t: t.opened), market)
+            if target is None:
+                log.warning("Setup %s: no target as of its first fill; keeping the order's", setup)
+                continue
+            for t in entries:
+                if abs(target - t.target) > 0.5 * self.pip:
+                    self.ex.set_take_profit(t, target, f"{setup} target as of first fill, was {t.target:.5f}")
 
     def handle_signals(self, signals, book, account):
         taken = {o.setup_id for o in book.pending} | {t.setup_id for t in book.trades}

@@ -6,9 +6,10 @@ Pure analysis: reads OHLC dataframes, returns zones. No API access, no orders.
 A zone is a move-in candle, 1-5 basing candles, and a move-out candle:
 
   - Basing candle: body <= 50% of its range (wick to wick).
-  - Rally candle (move-in or move-out): green, closes in the top 25% of its range,
-    and closes above the previous candle's high. A drop candle is the mirror
-    image. Neither can be a basing candle.
+  - Rally candle (move-in or move-out): closes in the top 25% of its range and
+    above the previous candle's high. Colour isn't checked ("candles do not have
+    to be green"); in practice a non-basing candle closing in its top quarter is
+    always green. A drop candle is the mirror image. Neither can be a basing candle.
   - Move-out: also at least 2x the range of the biggest basing candle and taller
     than the move-in candle.
   - More than 5 basing candles disqualifies the zone.
@@ -17,6 +18,10 @@ A zone is a move-in candle, 1-5 basing candles, and a move-out candle:
     zone that existed before the base formed; the zone becomes valid when a
     candle closes above it. If price comes back to the zone's entry edge before
     that, the zone is void. (Mirror image for supply.)
+  - Move away: price must travel at least 2x the zone's height away from the
+    zone (entry edge to the move's extreme) before coming back.
+  - The zone is valid (`valid_time`) once both the breakout and the move away
+    have happened. If price returns to the entry edge before then, it's void.
 
 Zone types (the move-in and move-out directions):
 
@@ -38,7 +43,7 @@ import pandas as pd
 from structure import find_swings
 
 ZONE_COLUMNS = [
-    "start_time", "legout_time", "breakout_time", "breakout_level", "type", "kind", "top", "bottom",
+    "start_time", "legout_time", "breakout_time", "valid_time", "breakout_level", "type", "kind", "top", "bottom",
     "base_candles", "impulse_pips", "impulse_ratio", "impulse_vs_base", "impulse_atr", "atr_pips",
 ]
 
@@ -56,6 +61,8 @@ class ZoneConfig:
     min_impulse_vs_base: float | None = 2.0
     # Breakout: the impulse must close beyond the prior swing before price returns to the zone.
     require_breakout: bool = True
+    # Move away: price must travel min_move_away x the zone height from the entry edge (None = off).
+    min_move_away: float | None = 2.0
     swing_strength: int = 2
     # Optional extra strength filter: move-out range >= legout_multiple x mean range of the previous
     # legout_lookback candles. None = off.
@@ -79,14 +86,14 @@ def atr(df, period=14):
     return true_range.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
 
 
-def candle_direction(o, h, l, c, i, close_zone):
+def candle_direction(h, l, c, i, close_zone):
     """'R' for a rally candle, 'D' for a drop candle, '' otherwise (see module docstring)."""
     rng = h[i] - l[i]
     if rng <= 0 or i == 0:
         return ""
-    if c[i] > o[i] and c[i] >= h[i] - close_zone * rng and c[i] > h[i - 1]:
+    if c[i] >= h[i] - close_zone * rng and c[i] > h[i - 1]:
         return "R"
-    if c[i] < o[i] and c[i] <= l[i] + close_zone * rng and c[i] < l[i - 1]:
+    if c[i] <= l[i] + close_zone * rng and c[i] < l[i - 1]:
         return "D"
     return ""
 
@@ -103,8 +110,9 @@ def reference_swing(levels, swing_idx, base_start, strength, beyond, demand):
 def detect_zones(df, config=None, pip=0.0001):
     """Return a dataframe of valid zones (one per move-out candle), oldest first.
 
-    `breakout_time` is the open time of the candle whose close made the breakout; NaT if the
-    breakout hasn't happened yet in this data (the zone isn't tradable yet).
+    `breakout_time` is the open time of the candle whose close made the breakout, and `valid_time`
+    the candle by which both the breakout and the move away had happened; NaT if not yet in this
+    data (the zone isn't tradable yet).
     """
     cfg = config or ZoneConfig()
     df = df.reset_index(drop=True)
@@ -121,7 +129,7 @@ def detect_zones(df, config=None, pip=0.0001):
     zones = []
     first = max(cfg.legout_lookback, cfg.atr_period) + cfg.max_base_candles + 2
     for i in range(first, len(df)):
-        out_dir = "" if basing[i] else candle_direction(o, h, l, c, i, cfg.close_zone)
+        out_dir = "" if basing[i] else candle_direction(h, l, c, i, cfg.close_zone)
         if not out_dir:
             continue
 
@@ -131,7 +139,7 @@ def detect_zones(df, config=None, pip=0.0001):
         leg_in = i - n - 1
         if n < cfg.min_base_candles or basing[leg_in]:
             continue  # no base, or more than max_base_candles basing candles
-        in_dir = candle_direction(o, h, l, c, leg_in, cfg.close_zone)
+        in_dir = candle_direction(h, l, c, leg_in, cfg.close_zone)
         if not in_dir:
             continue  # the candle before the base isn't a move-in candle
 
@@ -151,7 +159,7 @@ def detect_zones(df, config=None, pip=0.0001):
         elif n > 1:
             bottom = min(o[base].min(), c[base].min())
 
-        breakout_time, level = pd.NaT, np.nan
+        level, k_break = np.nan, i
         if cfg.require_breakout:
             ref = reference_swing(h if demand else l, swing_highs if demand else swing_lows, i - n,
                                   cfg.swing_strength, top if demand else bottom, demand)
@@ -159,19 +167,24 @@ def detect_zones(df, config=None, pip=0.0001):
                 continue  # nothing to break out of
             level = ref
             beyond = np.flatnonzero(c[i:] > ref if demand else c[i:] < ref)
-            k = i + beyond[0] if len(beyond) else len(df)
-            back = l[i + 1:k + 1] <= top if demand else h[i + 1:k + 1] >= bottom
-            if back.any():
-                continue  # price returned to the zone before the breakout: void
-            if k < len(df):
-                breakout_time = df["time"].iloc[k]
-        else:
-            breakout_time = df["time"].iloc[i]
+            k_break = i + beyond[0] if len(beyond) else len(df)
+        k_move = i
+        if cfg.min_move_away is not None:
+            travel = np.maximum.accumulate(h[i:]) - top if demand else bottom - np.minimum.accumulate(l[i:])
+            far = np.flatnonzero(travel >= cfg.min_move_away * (top - bottom))
+            k_move = i + far[0] if len(far) else len(df)
+        v = max(k_break, k_move)
+        back = l[i + 1:v + 1] <= top if demand else h[i + 1:v + 1] >= bottom
+        if back.any():
+            continue  # price returned to the zone before it became valid: void
+        breakout_time = df["time"].iloc[k_break] if k_break < len(df) else pd.NaT
+        valid_time = df["time"].iloc[v] if v < len(df) else pd.NaT
 
         zones.append({
             "start_time": df["time"].iloc[i - n],
             "legout_time": df["time"].iloc[i],
             "breakout_time": breakout_time,
+            "valid_time": valid_time,
             "breakout_level": level,
             "type": f"{in_dir}B{out_dir}",
             "kind": "demand" if demand else "supply",
@@ -186,4 +199,5 @@ def detect_zones(df, config=None, pip=0.0001):
         })
     out = pd.DataFrame(zones, columns=ZONE_COLUMNS)
     out["breakout_time"] = pd.to_datetime(out["breakout_time"], utc=True)
+    out["valid_time"] = pd.to_datetime(out["valid_time"], utc=True)
     return out

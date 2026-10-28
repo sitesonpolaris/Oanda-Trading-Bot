@@ -66,16 +66,17 @@ Steps to Drawing Zones":
 
 1. **Basing candle:** body ≤ 50% of its range. 1–5 of them form the base; more
    than 5 disqualifies the zone.
-2. **Move-in and move-out candles:** a rally candle is green, closes in the top
-   25% of its range, and closes above the previous candle's high (a drop candle
-   is the mirror image). The move-out must also be at least 2× the biggest
-   basing candle and taller than the move-in.
+2. **Move-in and move-out candles:** a rally candle closes in the top 25% of
+   its range and above the previous candle's high (a drop candle is the mirror
+   image); colour isn't checked. The move-out must also be at least 2× the
+   biggest basing candle and taller than the move-in.
 3. **Breakout:** the impulse must close beyond the most recent swing high
-   (demand) or swing low (supply) that existed before the base. The zone becomes
-   valid at that close; if price comes back to the zone first, it's void.
-4. **Types:** RBR / DBR (demand), DBD / RBD (supply). The strategy trades RBR and
-   DBD (`trade_types`); all valid zones count as opposing zones for targets.
-5. **Drawing:** one basing candle is wick to wick; with 2–5, a demand zone runs
+   (demand) or swing low (supply) that existed before the base.
+4. **Move away:** price must travel at least 2× the zone's height away from it.
+5. **Valid** once the breakout and the move away have both happened
+   (`valid_time`); if price comes back to the zone first, it's void.
+6. **Types:** RBR / DBR (demand), DBD / RBD (supply), all traded.
+7. **Drawing:** one basing candle is wick to wick; with 2–5, a demand zone runs
    from the highest body (entry) to the lowest wick, a supply zone from the
    lowest body (entry) to the highest wick.
 
@@ -97,33 +98,30 @@ python detect_zones.py --plot-at "2026-03-12 14:00"   # chart the zone nearest a
 
 ## Market structure (`structure.py`)
 
-On any timeframe (D1 trend, H4 momentum, H1 adds): swing highs/lows are 5-candle fractals (2 candles each side), only known
-once those candles close. Trend is **up** (higher high + higher low), **down**
-(lower high + lower low) or **sideways** (mixed). A **break of structure** is a
-close beyond the most recent swing high (bullish) or swing low (bearish); a BOS
-against the trend turns it sideways until the next swing forms.
+On any timeframe (D1 stage, H4 momentum, H1 adds): swing highs/lows are 5-candle
+fractals (2 candles each side), only known once those candles close. Trend uses
+the course's stages: **up** (Stage 2) = higher high + higher low with rising 20-
+and 40-period averages; **down** (Stage 4) = the mirror image; **sideways**
+otherwise. A **break of structure** is a close beyond the most recent swing high
+(bullish) or swing low (bearish); a BOS against the trend turns it sideways
+until the next swing forms.
 
 ## Strategy (`strategy.py`)
 
-Implements the strategy spec (Oct 10, 2026). The same rules drive the backtest
-and the live bot.
+Follows the TWP Market Structure course where it's specific, and the strategy
+spec (Oct 10, 2026) elsewhere. The same rules drive the backtest and the live bot.
 
-- **Timeframes:** trend on D1, momentum on H4, zones and entries on H1.
-- **Direction:** H4 momentum must have agreed with the trade when the zone
-  formed (price has to pull back against the trade to reach the zone, which
-  turns momentum, so it isn't checked at the touch). The D1 trend must agree
-  when price returns; a countertrend trade is allowed only once a D1 break of
-  structure has neutralised the opposing trend.
-- **Zone edges:** entry at the wick (single-candle base) or body (multi-candle
-  base); stop beyond the base's wick extreme + 0.1 × ATR.
-- **Zones:** valid course zones only (see Zone detection); RBR for longs, DBD
-  for shorts.
-- **Target (room):** long trades aim 80% of the way from the top of the demand
-  zone to the bottom of the next supply zone above; short trades aim 80% of the
-  way from the bottom of the supply zone to the top of the next demand zone
-  below (nearest active strong H1 or H4 zone). No opposing zone, no trade; too
-  little room fails the 2R minimum. The plan is fixed and the limit order goes
-  in as soon as the breakout candle closes.
+- **Timeframes:** stage on D1, momentum on H4, zones and entries on H1.
+- **Direction:** all timeframes must align: D1 in Stage 2 for longs (Stage 4 for
+  shorts) when price returns, and H4 momentum the same way when the zone became
+  valid. Countertrend trades are off (`allow_countertrend_with_bos`).
+- **Entry:** limit order at the zone's entry edge as soon as the zone is valid.
+- **Stop:** beyond the zone's far edge by 10% of the daily ATR (course: swing
+  trades on 30-minute charts and above).
+- **Target:** when price returns, the nearer of the prior pivot (most recent
+  confirmed H1 swing high above a long's entry / low below a short's) and the
+  edge of the nearest active opposing H1 or H4 zone. Neither, or under 2:1, no
+  trade. Live, the bot sets this target on the trade once the order fills.
 - **Playing field:** skip if 5+ of the last 20 H1 candles have wicks ≥ 1× ATR;
   skip within 30 min of high-impact news for either currency.
   The news filter needs `data/news_events.csv` (`time,currency,impact`, UTC)
@@ -153,7 +151,7 @@ python backtest.py --instruments GBP_USD AUD_USD USD_JPY  # other pairs (per-pai
   first. Weekend gaps fill at the gap price.
 - Results are in R of the full per-trade risk (1% by default): a stop-out with
   only the first entry is −⅓R.
-- Grid: ATR buffer 0.1 / 0.2 / 0.25 × impulse strength filter off / 2× / 2.5× / 3×.
+- Grid: stop buffer 0.1 / 0.2 / 0.25 of the daily ATR × impulse strength filter off / 2× / 2.5× / 3×.
 
 Output in `output/backtest/`: `trades_<instrument>_H1_m<multiple>_b<buffer>.csv`
 (every zone: plan, filter verdict, fill, adds, exit, R) and `grid_results.csv`.
