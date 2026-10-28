@@ -2,7 +2,7 @@
 
 Automated Forex trading bot for the **OANDA practice (fxTrade Practice) account only**.
 
-Current stage: **data feed + zone detection** — analysis only, no trading or order code yet.
+Current stage: **data feed, zone detection, market structure, backtest** — no live trading or order code yet.
 
 ## Setup
 
@@ -90,4 +90,43 @@ python detect_zones.py --multiple 3 --max-base 2 --lookback 20
 python detect_zones.py --plot-at "2026-03-12 14:00"   # chart the zone nearest a time
 ```
 
-Tests: `pip install -r requirements-dev.txt && python -m pytest`
+## Market structure (`structure.py`)
+
+On H4: swing highs/lows are 5-candle fractals (2 candles each side), only known
+once those candles close. Trend is **up** (higher high + higher low), **down**
+(lower high + lower low) or **sideways** (mixed). A **break of structure** is a
+close beyond the most recent swing high (bullish) or swing low (bearish); a BOS
+against the trend turns it sideways until the next swing forms.
+
+## Backtest
+
+```bash
+python backtest.py
+```
+
+- Uses only the **first 18 months** of data; the rest is cut off before anything
+  is computed and kept for validation.
+- Demand zones are traded only in an H4 uptrend, supply zones only in a downtrend
+  (trend as of the last closed H4 candle).
+- Limit entry at the zone's near edge on the first return to a fresh zone. That
+  first touch uses up the zone, traded or not.
+- Stop: far edge + 0.1 × ATR. Target: 80% of the leg-out range from entry.
+  Skipped if target < 2 × stop distance.
+- Simulated on H1 candles with a 1.2-pip spread (buys fill on the ask, sells on
+  the bid). If a candle hits stop and target, the stop counts first.
+- 1% risk per trade, compounding, for return and drawdown.
+- Runs the baseline plus a grid of ATR buffer 0.1 / 0.2 / 0.25 × leg-out multiple
+  2 / 2.5 / 3, for H1 and H4 zones.
+
+Output in `output/backtest/`: `trades_<instrument>_<tf>_m<multiple>_b<buffer>.csv`
+(every zone with entry, stop, target, fill, exit, result, R), `grid_results.csv`,
+and `<instrument>_H4_structure.csv` (trend and BOS per H4 candle).
+
+Options: `--spread 1.0`, `--risk 0.005`, `--zones-tf H1`, `--in-sample-months 18`.
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest
+```
