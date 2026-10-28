@@ -153,6 +153,14 @@ python backtest.py --instruments GBP_USD AUD_USD USD_JPY  # other pairs (per-pai
   only the first entry is −⅓R.
 - Grid: stop buffer 0.1 / 0.2 / 0.25 of the daily ATR × impulse strength filter off / 2× / 2.5× / 3×.
 
+Chart trades from the logs (zones, entry, stop loss, take profit, fill, exit):
+
+```bash
+python plot_trades.py                      # 3 winners + 3 losers across the four pairs
+```
+
+Charts go to `output/charts/trades/`.
+
 Output in `output/backtest/`: `trades_<instrument>_H1_m<multiple>_b<buffer>.csv`
 (every zone: plan, filter verdict, fill, adds, exit, R) and `grid_results.csv`.
 
