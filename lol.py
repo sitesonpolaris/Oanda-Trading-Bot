@@ -14,7 +14,8 @@ Long (short is the mirror image):
      candle can be the RBR's move-in. "Same rally": price doesn't come back to
      the DBR, and after the break doesn't close back below the broken level.
      `pause_candles` counts the candles from the DBR's move-out to the RBR's base;
-     `max_pause_candles` (None = no limit) caps it.
+     `max_pause_candles` (None = no limit) caps it. Optionally the DBR's
+     move-out must be `min_reversal_vs_prev` x the range of the candle before it.
   4. Entry: limit order at the top of the RBR from the candle after its move-out.
   5. Stop: bottom of the RBR minus `atr_buffer` x the daily ATR.
   6. Trend: not required. The break of structure and the stacked zone are the
@@ -59,6 +60,8 @@ class LoLConfig:
         require_breakout=False, min_impulse_vs_base=None, move_out_taller_than_move_in=False, min_move_away=None))
     # Most candles from the DBR's move-out to the start of the RBR's base (None = no limit).
     max_pause_candles: int | None = None
+    # The DBR's move-out range >= this multiple of the candle before it (None = off).
+    min_reversal_vs_prev: float | None = None
 
 
 def find_setups(h1, cfg=None, pip=0.0001):
@@ -70,17 +73,24 @@ def find_setups(h1, cfg=None, pip=0.0001):
     ms = market_structure(h1, SWINGS_ONLY)
     trend = ms["trend"].to_numpy()
     lo, hi, c = h1["low"].to_numpy(), h1["high"].to_numpy(), h1["close"].to_numpy()
+    rng = hi - lo
+    by_type = {t: continuations[continuations["type"] == t] for t in ("RBR", "DBD")}
     rows = []
     for rev in reversals[reversals["type"].isin(["DBR", "RBD"])].itertuples(index=False):
         demand = rev.kind == "demand"
         legout = int(times.searchsorted(rev.legout_time))
+        vs_prev = rng[legout] / rng[legout - 1] if rng[legout - 1] > 0 else np.inf
+        if cfg.min_reversal_vs_prev is not None and vs_prev < cfg.min_reversal_vs_prev:
+            continue  # the DBR's move-out isn't strong enough against the candle before it
         if trend[legout - 1] != ("down" if demand else "up"):
             continue  # no lower highs and lower lows (or higher highs and lows) for the rally to reverse
         level = ms["last_swing_high" if demand else "last_swing_low"].iat[legout - 1]  # the lower high to break
         if np.isnan(level):
             continue
         beyond = c > level if demand else c < level
-        for cont in continuations[continuations["type"] == ("RBR" if demand else "DBD")].itertuples(index=False):
+        conts = by_type["RBR" if demand else "DBD"]
+        conts = conts[conts["start_time"] > rev.legout_time]  # move-in at or after the DBR's move-out
+        for cont in conts.itertuples(index=False):
             move_in = int(times.searchsorted(cont.start_time)) - 1
             if move_in < legout:
                 continue
@@ -105,6 +115,7 @@ def find_setups(h1, cfg=None, pip=0.0001):
                 "cont_type": cont.type, "cont_start": cont.start_time, "cont_legout": cont.legout_time,
                 "cont_top": cont.top, "cont_bottom": cont.bottom, "cont_valid": cont.valid_time,
                 "pause_candles": move_in + 1 - legout,
+                "rev_out_vs_prev": round(vs_prev, 2),
             })
             break
     return pd.DataFrame(rows)
