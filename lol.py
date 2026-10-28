@@ -5,25 +5,25 @@ Long (short is the mirror image):
   1. Downtrend: when the DBR's rally starts, the last two H1 swing highs and lows
      are lower highs and lower lows.
   2. Reversal: a DBR demand zone. It doesn't need the 2x move-out (the break of
-     structure is the strength test). Its rally closes above the most recent
-     lower high (break of structure) before price comes back to the zone.
-  3. Level on level (drop-base-rally-base-rally): the first RBR demand zone that
-     completes after the break of structure. The DBR's rally candle can be the
-     RBR's move-in. "Same rally": until the RBR's base starts, no candle closes
-     back below the broken lower high (the pause can chop sideways above it).
+     structure is the strength test).
+  3. Level on level (drop-base-rally-base-rally): the RBR demand zone that follows
+     the DBR in the same rally and breaks structure: by the close of the RBR's
+     move-out, price has closed above the lower high that stood when the DBR's
+     rally started (the DBR's rally may already have done it). The DBR's rally
+     candle can be the RBR's move-in. "Same rally": price doesn't come back to
+     the DBR, and after the break doesn't close back below the broken level.
+     `pause_candles` counts the candles from the DBR's move-out to the RBR's base;
+     `max_pause_candles` (None = no limit) caps it.
   4. Entry: limit order at the top of the RBR once the RBR is valid (2x move away).
   5. Stop: bottom of the RBR minus `atr_buffer` x the daily ATR.
   6. Trend: not required. The break of structure and the stacked zone are the
      momentum signal, so the setup is traded even against the D1/H4 trend.
      Each setup records whether D1 and H4 agreed (`trend_aligned`), so aligned
      and countertrend setups can be compared.
-     Optionally, the RBR's base must start within `max_pause_candles` candles of
-     the break of structure.
   7. Target (when price comes back to the RBR): `target_fraction` (80%) of the
      way to the nearest unbroken H1 supply zone above (touched is fine); if
-     there is none, the
-     RBR's move-out distance (top of the RBR to the high before the return)
-     projected from the entry. Under `min_reward_risk`, no trade.
+     there is none, the RBR's move-out distance (top of the RBR to the high
+     before the return) projected from the entry. Under `min_reward_risk`, no trade.
 
 Usage:
     python lol.py                                   # count setups and simulate them, four pairs
@@ -54,7 +54,7 @@ class LoLConfig:
     zones: ZoneConfig = field(default_factory=ZoneConfig)
     # The reversal zone doesn't need the move-out to be 2x the base.
     reversal_impulse_vs_base: float | None = None
-    # Most candles from the break of structure to the start of the RBR's base (None = no limit).
+    # Most candles from the DBR's move-out to the start of the RBR's base (None = no limit).
     max_pause_candles: int | None = None
 
 
@@ -67,7 +67,7 @@ def find_setups(h1, cfg=None, pip=0.0001):
     reversals = detect_zones(h1, ZoneConfig(**{**no_breakout, "min_impulse_vs_base": cfg.reversal_impulse_vs_base}), pip=pip)
     continuations = detect_zones(h1, ZoneConfig(**no_breakout), pip=pip)
     ms = market_structure(h1, SWINGS_ONLY)
-    trend, bos_dir = ms["trend"].to_numpy(), ms["bos"].to_numpy()
+    trend = ms["trend"].to_numpy()
     lo, hi, c = h1["low"].to_numpy(), h1["high"].to_numpy(), h1["close"].to_numpy()
     rows = []
     for rev in reversals[reversals["type"].isin(["DBR", "RBD"])].itertuples(index=False):
@@ -75,25 +75,27 @@ def find_setups(h1, cfg=None, pip=0.0001):
         legout = int(times.searchsorted(rev.legout_time))
         if trend[legout - 1] != ("down" if demand else "up"):
             continue  # no lower highs and lower lows (or higher highs and lows) for the rally to reverse
-        breaks = np.flatnonzero(bos_dir[legout:] == ("bullish" if demand else "bearish"))
-        if not len(breaks):
+        level = ms["last_swing_high" if demand else "last_swing_low"].iat[legout - 1]  # the lower high to break
+        if np.isnan(level):
             continue
-        bos = legout + breaks[0]
-        back = lo[legout + 1:bos + 1] <= rev.top if demand else hi[legout + 1:bos + 1] >= rev.bottom
-        if back.any():
-            continue  # price came back to the reversal zone before breaking structure
-        level = ms["last_swing_high" if demand else "last_swing_low"].iat[bos - 1]  # the level the BOS broke
+        beyond = c > level if demand else c < level
         for cont in continuations[continuations["type"] == ("RBR" if demand else "DBD")].itertuples(index=False):
             move_in = int(times.searchsorted(cont.start_time)) - 1
+            if move_in < legout:
+                continue
             cont_out = int(times.searchsorted(cont.legout_time))
-            if move_in < legout or cont_out <= bos:
-                continue  # the continuation must complete after the break of structure
-            if cfg.max_pause_candles is not None and move_in + 1 - bos > cfg.max_pause_candles:
-                break  # too long after the break of structure
-            pause = slice(bos + 1, move_in + 1)
-            failed = (c[pause] < level) if demand else (c[pause] > level)
+            if cfg.max_pause_candles is not None and move_in + 1 - legout > cfg.max_pause_candles:
+                break  # the RBR came too long after the DBR
+            back = lo[legout + 1:cont_out + 1] <= rev.top if demand else hi[legout + 1:cont_out + 1] >= rev.bottom
+            if back.any():
+                break  # price came back to the DBR: not the same rally
+            breaks = np.flatnonzero(beyond[legout:cont_out + 1])
+            if not len(breaks):
+                continue  # this RBR hasn't broken structure yet; the next one in the rally might
+            bos = legout + breaks[0]
+            failed = ~beyond[bos + 1:move_in + 1]
             if failed.any():
-                break  # the broken level gave way before this pause: not the same rally
+                break  # closed back below the broken level before this RBR: not the same rally
             rows.append({
                 "side": "long" if demand else "short",
                 "rev_type": rev.type, "rev_start": rev.start_time, "rev_legout": rev.legout_time,
@@ -101,7 +103,7 @@ def find_setups(h1, cfg=None, pip=0.0001):
                 "bos_time": times.iat[bos], "bos_level": level,
                 "cont_type": cont.type, "cont_start": cont.start_time, "cont_legout": cont.legout_time,
                 "cont_top": cont.top, "cont_bottom": cont.bottom, "cont_valid": cont.valid_time,
-                "pause_candles": move_in + 1 - bos,
+                "pause_candles": move_in + 1 - legout,
             })
             break
     return pd.DataFrame(rows)
