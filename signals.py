@@ -1,58 +1,133 @@
 """Turn the latest candles into trade signals, using the same rules as the backtest.
 
-A zone produces a signal when it is fresh (price has not come back to its entry
-since the leg-out), the H4 trend agrees with it, and the target is at least
-`min_reward_risk` times the stop distance. Every zone's outcome is returned
-with a reason, so the bot can log why each one was or wasn't traded.
+Each H1 zone gets a verdict with a reason, so the bot can log why it was or
+wasn't traded:
+
+    touched           price already came back to the zone (not fresh)
+    waiting_impulse   the impulse extreme isn't confirmed by a swing yet
+    skipped_rr        target < min_reward_risk x stop distance
+    skipped_trend     D1 trend / H4 momentum don't allow this direction
+    skipped_news      high-impact news within the window
+    skipped_erratic   too many big wicks recently
+    skipped_room      opposing zone too close
+    signal            place a limit order
+
+Scale-ins: an open trade gets a market add signal after an H1 break of
+structure in its favour that happened after its latest entry.
 """
 
 from dataclasses import dataclass
 
-from backtest import TIMEFRAMES, plan_trade
+import numpy as np
+
 from risk_manager import Signal
+from strategy import (big_wicks, direction_check, impulse_extreme, level_on_level, news_conflict, plan_trade,
+                      room_to_opposing)
+from structure import find_swings
+from zones import atr
+
+H1 = np.timedelta64(1, "h")
 
 
 @dataclass
 class ZoneVerdict:
     setup_id: str
     zone: object
-    status: str        # "signal", "touched", "skipped_trend", "skipped_rr"
+    status: str
     detail: str
     signal: Signal | None = None
+    level_on_level: bool = False
 
 
-def setup_id(instrument, zone_tf, zone):
-    return f"{instrument}-{zone_tf}-{zone.start_time:%Y%m%d%H%M}"
+def setup_id(instrument, zone):
+    return f"{instrument}-H1-{zone.start_time:%Y%m%d%H%M}"
 
 
-def latest_bos_time(structure, direction):
-    hits = structure.loc[structure["bos"] == direction, "available_time"]
-    return hits.iloc[-1].to_pydatetime() if len(hits) else None
-
-
-def evaluate_zones(zones, candles, structure, cfg, instrument, zone_tf, pip, now):
-    """Return a ZoneVerdict per zone. `structure` needs trend, bos and available_time columns."""
+def latest(structure, now):
     known = structure[structure["available_time"] <= now]
-    trend = known["trend"].iloc[-1] if len(known) else "sideways"
-    bos = {"long": latest_bos_time(known, "bullish"), "short": latest_bos_time(known, "bearish")}
+    return known.iloc[-1] if len(known) else None
+
+
+def recent_big_wicks(candles, cfg):
+    """Big-wick candles among the last `wick_lookback` closed candles (same measure as the backtest)."""
+    return int(big_wicks(candles, atr(candles).to_numpy(), cfg).iloc[-cfg.wick_lookback:].sum())
+
+
+def evaluate_zones(zones, market, cfg, pip, now):
+    """A ZoneVerdict per H1 zone as of `now` (market candles must all have closed by then)."""
+    bars = market.bars
+    h, l = bars["high"].to_numpy(), bars["low"].to_numpy()
+    swings = find_swings(bars, cfg.impulse_swing_strength)
+    d1, h4 = latest(market.d1, now), latest(market.h4, now)
+    d1_trend, d1_bos = (d1["trend"], d1["last_bos"]) if d1 is not None else ("sideways", "")
+    h4_trend = h4["trend"] if h4 is not None else "sideways"
+    h1_bos = {"long": _last_bos_time(market.h1, "bullish", now), "short": _last_bos_time(market.h1, "bearish", now)}
+    big_wicks = recent_big_wicks(bars, cfg)
+    news = news_conflict(market.news, market.instrument, now, now + H1, cfg)
+
     verdicts = []
     for z in zones.itertuples(index=False):
-        sid = setup_id(instrument, zone_tf, z)
-        entry, stop, target = plan_trade(z, cfg, pip)
+        sid = setup_id(market.instrument, z)
         long = z.kind == "demand"
-        after = candles[candles["time"] >= z.legout_time + TIMEFRAMES[zone_tf]]
-        touched = (after["low"] <= entry).any() if long else (after["high"] >= entry).any()
-        risk, reward = abs(entry - stop), abs(target - entry)
-        plan = f"{z.type} entry {entry:.5f} SL {stop:.5f} TP {target:.5f} RR {reward / risk:.2f}"
-        if touched:
-            verdicts.append(ZoneVerdict(sid, z, "touched", f"{plan}: price already returned to the zone"))
-        elif reward < cfg.min_reward_risk * risk:
-            verdicts.append(ZoneVerdict(sid, z, "skipped_rr", f"{plan}: below {cfg.min_reward_risk}R"))
-        elif trend != ("up" if long else "down"):
-            verdicts.append(ZoneVerdict(sid, z, "skipped_trend", f"{plan}: H4 trend is {trend}"))
+        lol = level_on_level(z, market.all_zones, z.atr_pips * pip, cfg)
+        tag = " [level-on-level]" if lol else ""
+        legout = int(bars["time"].searchsorted(z.legout_time))
+        near = z.top if long else z.bottom
+        if (l[legout + 1:] <= near).any() if long else (h[legout + 1:] >= near).any():
+            verdicts.append(ZoneVerdict(sid, z, "touched", f"{z.type}{tag}: price already returned to the zone",
+                                        level_on_level=lol))
+            continue
+        confirmed = impulse_extreme(z.kind, h, l, swings["swing_high"].to_numpy(), swings["swing_low"].to_numpy(),
+                                    legout, cfg.impulse_swing_strength)
+        if confirmed is None or confirmed[0] >= len(bars):
+            verdicts.append(ZoneVerdict(sid, z, "waiting_impulse", f"{z.type}{tag}: impulse extreme not confirmed yet",
+                                        level_on_level=lol))
+            continue
+
+        entry, stop, target = plan_trade(z, confirmed[1], cfg, pip)
+        risk, reward = abs(entry - stop), (target - entry) * (1 if long else -1)
+        plan = f"{z.type}{tag} entry {entry:.5f} SL {stop:.5f} TP {target:.5f} RR {reward / risk:.2f}"
+        ok, why = direction_check(long, d1_trend, d1_bos, h4_trend, cfg)
+        room = room_to_opposing(long, entry, now, market.all_zones)
+        if reward < cfg.min_reward_risk * risk:
+            status, detail = "skipped_rr", f"{plan}: below {cfg.min_reward_risk}R"
+        elif not ok:
+            status, detail = "skipped_trend", f"{plan}: {why}"
+        elif news is not None:
+            status, detail = "skipped_news", f"{plan}: {news['currency']} news at {news['time']:%Y-%m-%d %H:%M}"
+        elif big_wicks >= cfg.max_big_wicks:
+            status, detail = "skipped_erratic", f"{plan}: {big_wicks} big wicks in last {cfg.wick_lookback} candles"
+        elif room < cfg.min_room_rr * risk:
+            status, detail = "skipped_room", f"{plan}: opposing zone {room / risk:.1f}R away"
         else:
             side = "long" if long else "short"
-            sig = Signal(instrument, side, entry, stop, target, sid, now, bos_time=bos[side])
-            verdicts.append(ZoneVerdict(sid, z, "signal", plan, sig))
-    return verdicts
+            sig = Signal(market.instrument, side, entry, stop, target, sid, now, bos_time=h1_bos[side])
+            verdicts.append(ZoneVerdict(sid, z, "signal", f"{plan}, {why}", sig, lol))
+            continue
+        verdicts.append(ZoneVerdict(sid, z, status, detail, level_on_level=lol))
+    # Level-on-level setups first: they get the open-position slots if there aren't enough.
+    return sorted(verdicts, key=lambda v: not v.level_on_level)
 
+
+def add_signals(trades, market, cfg, now):
+    """Market scale-in signals for open bot trades with a favourable H1 BOS since their latest entry."""
+    out = []
+    by_setup = {}
+    for t in trades:
+        if t.setup_id != "manual" and t.target is not None:
+            by_setup.setdefault(t.setup_id, []).append(t)
+    last_close = market.bars["close"].iat[-1]
+    for sid, entries in by_setup.items():
+        first = min(entries, key=lambda t: t.opened)
+        long = first.units > 0
+        bos = _last_bos_time(market.h1, "bullish" if long else "bearish", now)
+        if len(entries) > cfg.max_adds or bos is None or bos <= max(t.opened for t in entries):
+            continue
+        out.append(Signal(market.instrument, "long" if long else "short", last_close, first.stop, first.target,
+                          sid, now, bos_time=bos, order_type="MARKET"))
+    return out
+
+
+def _last_bos_time(structure, direction, now):
+    hits = structure[(structure["bos"] == direction) & (structure["available_time"] <= now)]
+    return hits["available_time"].iat[-1].to_pydatetime() if len(hits) else None

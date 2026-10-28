@@ -10,7 +10,8 @@ Trend: compares the last two confirmed swing highs and the last two swing lows.
     sideways  anything else (mixed, or not enough swings yet)
 
 BOS: a candle closes above the most recent swing high (bullish) or below the
-most recent swing low (bearish). Each swing can be broken once. With
+most recent swing low (bearish). Each swing can be broken once. `last_bos` carries
+the direction of the most recent BOS forward. With
 `bos_invalidates_trend`, a BOS against the current trend turns it sideways
 until the next swing is confirmed.
 """
@@ -61,6 +62,7 @@ def market_structure(df, config=None):
     highs, lows = [], []
     high_broken = low_broken = False
     against = None  # direction of a BOS that went against the trend since the last swing
+    last_bos = ""
     rows = []
     for k in range(len(df)):
         j = k - n  # the candle whose swing status is confirmed by this close
@@ -77,6 +79,7 @@ def market_structure(df, config=None):
             bos, high_broken = "bullish", True
         elif lows and not low_broken and c[k] < lows[-1]:
             bos, low_broken = "bearish", True
+        last_bos = bos or last_bos
         if (bos == "bearish" and structure == "up") or (bos == "bullish" and structure == "down"):
             against = bos
 
@@ -85,6 +88,7 @@ def market_structure(df, config=None):
             "time": df["time"].iat[k],
             "trend": trend,
             "bos": bos,
+            "last_bos": last_bos,
             "last_swing_high": highs[-1] if highs else np.nan,
             "last_swing_low": lows[-1] if lows else np.nan,
         })

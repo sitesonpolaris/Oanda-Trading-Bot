@@ -1,22 +1,23 @@
-"""Backtest the supply/demand zone strategy on the in-sample period only.
+"""Backtest the strategy spec on the in-sample period only.
 
-Rules:
-  - Zones come from zones.py (H1 or H4). A zone becomes active once its leg-out candle closes.
-  - Only trade with the H4 trend: demand zones in an uptrend, supply zones in a downtrend.
-  - Limit entry at the zone's near edge (top of demand, bottom of supply) on the first
-    return to the zone. That first touch uses up the zone, traded or not.
-  - Stop beyond the far edge plus `atr_buffer` x ATR. Target at `target_fraction` of the
-    impulse (leg-out range) from entry. Skip if target < `min_reward_risk` x stop distance.
+Rules (see strategy.py): H1 zones, D1 trend + H4 momentum, limit entry at the
+zone's near edge once the impulse extreme is confirmed, stop beyond the far edge
++ ATR buffer, target at 80% of the impulse from its origin, playing-field filters
+(room to opposing zone, erratic wicks, news), a one-third first entry with up to
+two one-third adds on H1 breaks of structure in the trade's favour.
 
 Execution is simulated on H1 mid candles with a fixed spread: buys fill and exit
-on the ask/bid side of the spread, so every trade pays it. When one candle hits
-both stop and target, the stop is assumed to come first.
+on the ask/bid side, so every entry, add and exit pays it. When one candle hits
+both stop and target, the stop is assumed to come first. A setup's result is in R
+of the full per-trade risk: a stop-out with all three entries is -1R, a stop-out
+with only the first entry is -1/3R.
 
-The last `validation_months` of data are cut off before anything is computed.
+The last part of the data (everything after `--in-sample-months`) is cut off
+before anything is computed.
 
 Usage:
-    python backtest.py                      # baseline + parameter grid, H1 and H4 zones
-    python backtest.py --spread 1.0 --zones-tf H1
+    python backtest.py                      # baseline + parameter grid
+    python backtest.py --spread 1.0 --risk 0.005
 """
 
 import argparse
@@ -28,113 +29,185 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from structure import StructureConfig, market_structure
-from zones import ZoneConfig, detect_zones, pip_size
+from strategy import (StrategyConfig, big_wick_counts, direction_check, impulse_extreme, level_on_level,
+                      load_news, news_conflict, plan_trade, room_to_opposing, zone_lifecycle)
+from structure import StructureConfig, find_swings, market_structure
+from zones import ZoneConfig, atr, detect_zones, pip_size
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
 OUT_DIR = ROOT / "output" / "backtest"
+NEWS_PATH = DATA_DIR / "news_events.csv"
 
-TIMEFRAMES = {"H1": pd.Timedelta("1h"), "H4": pd.Timedelta("4h")}
+TIMEFRAMES = {"H1": pd.Timedelta("1h"), "H4": pd.Timedelta("4h"), "D": pd.Timedelta("1D")}
 BUFFERS = [0.1, 0.2, 0.25]
 MULTIPLES = [2.0, 2.5, 3.0]
 
 
 @dataclass
-class BacktestConfig:
-    atr_buffer: float = 0.1
-    target_fraction: float = 0.8
-    min_reward_risk: float = 2.0
+class BacktestConfig(StrategyConfig):
     spread_pips: float = 1.2
-    risk_per_trade: float = 0.01
+    risk_per_trade: float = 0.01   # full per-trade risk; entries are fractions of it
     starting_equity: float = 10_000.0
 
 
-def plan_trade(zone, cfg, pip):
-    """Entry at the near edge, stop beyond the far edge + ATR buffer, target at a fraction of the impulse."""
-    buffer = cfg.atr_buffer * zone.atr_pips * pip
-    impulse = cfg.target_fraction * zone.impulse_pips * pip
-    if zone.kind == "demand":
-        return zone.top, zone.bottom - buffer, zone.top + impulse
-    return zone.bottom, zone.top + buffer, zone.bottom - impulse
+@dataclass
+class Market:
+    """Everything the strategy looks at, built once per zone-detection setting."""
+    bars: pd.DataFrame        # H1 candles: zones, entries and execution
+    d1: pd.DataFrame          # D1 structure (trend, last_bos, available_time)
+    h4: pd.DataFrame          # H4 structure (momentum)
+    h1: pd.DataFrame          # H1 structure (BOS events for adds), aligned with bars
+    all_zones: pd.DataFrame   # H1 + H4 zones with available/broken times (room, level-on-level)
+    news: pd.DataFrame | None
+    instrument: str
+
+
+def with_available_time(structure, granularity):
+    return structure.assign(available_time=structure["time"] + TIMEFRAMES[granularity])
+
+
+def build_market(h1, h4, d1, zone_cfg, instrument, pip, news=None, structure_cfg=None):
+    """Return (Market, H1 zones with lifecycle columns)."""
+    scfg = structure_cfg or StructureConfig()
+    h1_zones = zone_lifecycle(detect_zones(h1, zone_cfg, pip=pip), h1, TIMEFRAMES["H1"]).assign(tf="H1")
+    h4_zones = zone_lifecycle(detect_zones(h4, zone_cfg, pip=pip), h4, TIMEFRAMES["H4"]).assign(tf="H4")
+    market = Market(
+        bars=h1,
+        d1=with_available_time(market_structure(d1, scfg), "D"),
+        h4=with_available_time(market_structure(h4, scfg), "H4"),
+        h1=with_available_time(market_structure(h1, scfg), "H1"),
+        all_zones=pd.concat([h1_zones, h4_zones], ignore_index=True),
+        news=news,
+        instrument=instrument,
+    )
+    return market, h1_zones
+
+
+def state_at_bars(bars, structure, columns):
+    """Structure columns as known at each bar's open (latest row whose candle had closed)."""
+    merged = pd.merge_asof(bars[["time"]], structure.sort_values("available_time")[["available_time", *columns]],
+                           left_on="time", right_on="available_time")
+    return {c: merged[c].fillna("sideways" if c == "trend" else "").to_numpy() for c in columns}
 
 
 def first_true(mask):
     return int(np.argmax(mask)) if mask.any() else None
 
 
-def simulate(zones, bars, trend, cfg, zone_tf, pip):
-    """One row per zone: trade details and outcome, or why it wasn't traded."""
+def exit_after_fill(f, long, stop, target, bid, ask):
+    """(exit bar, result, exit price) for a position filled during bar f."""
+    side = bid if long else ask
+    if long:
+        stop_hit, target_hit = side["low"][f:] <= stop, side["high"][f:] >= target
+    else:
+        stop_hit, target_hit = side["high"][f:] >= stop, side["low"][f:] <= target
+    target_hit[0] = False  # can't tell whether the target came after the fill within the candle
+    s, t = first_true(stop_hit), first_true(target_hit)
+    if s is None and t is None:
+        return len(side["close"]) - 1, "open_at_end", side["close"][-1]
+    e = min(x for x in (s, t) if x is not None) + f
+    gap_open = side["open"][e]
+    opened_at_target = e > f and (gap_open >= target if long else gap_open <= target)
+    if t is not None and t + f == e and (s is None or s + f != e or opened_at_target):
+        return e, "win", max(target, gap_open) if long else min(target, gap_open)
+    gapped = e > f and (gap_open <= stop if long else gap_open >= stop)
+    return e, "loss", gap_open if gapped else stop
+
+
+def simulate(zones, market, cfg, pip):
+    """One row per zone: the trade and its outcome, or why it wasn't traded."""
+    bars = market.bars
+    times = bars["time"]
     half = cfg.spread_pips * pip / 2
     o, h, l, c = (bars[col].to_numpy() for col in ("open", "high", "low", "close"))
     bid = {"open": o - half, "high": h - half, "low": l - half, "close": c - half}
-    ask = {"open": o + half, "high": h + half, "low": l + half}
-    trend_at = pd.merge_asof(bars[["time"]], trend.sort_values("available_time"),
-                             left_on="time", right_on="available_time")["trend"].to_numpy()
+    ask = {"open": o + half, "high": h + half, "low": l + half, "close": c + half}
+    swings = find_swings(bars, cfg.impulse_swing_strength)
+    swing_high, swing_low = swings["swing_high"].to_numpy(), swings["swing_low"].to_numpy()
+    atr_values = atr(bars).to_numpy()
+    wicks = big_wick_counts(bars, atr_values, cfg)
+    d1 = state_at_bars(bars, market.d1, ["trend", "last_bos"])
+    h4 = state_at_bars(bars, market.h4, ["trend"])
+    h1_bos = market.h1["bos"].to_numpy()
 
     out = []
     for z in zones.itertuples(index=False):
         long = z.kind == "demand"
-        entry, stop, target = plan_trade(z, cfg, pip)
-        risk, reward = abs(entry - stop), abs(target - entry)
-        row = {
-            "zone_start": z.start_time, "zone_type": z.type, "side": "long" if long else "short",
-            "zone_top": z.top, "zone_bottom": z.bottom, "entry": entry, "stop": stop,
-            "target": round(target, 5), "risk_pips": round(risk / pip, 1),
-            "planned_rr": round(reward / risk, 2), "spread_r": round(cfg.spread_pips * pip / risk, 3),
-            "status": "", "trend_at_touch": "", "entry_time": pd.NaT, "fill_price": np.nan,
-            "exit_time": pd.NaT, "exit_price": np.nan, "result": "", "pips": np.nan, "r_multiple": np.nan,
-        }
+        row = {"zone_start": z.start_time, "zone_type": z.type, "side": "long" if long else "short",
+               "level_on_level": level_on_level(z, market.all_zones, z.atr_pips * pip, cfg),
+               "zone_top": z.top, "zone_bottom": z.bottom, "status": "", "reason": ""}
         out.append(row)
-        if reward < cfg.min_reward_risk * risk:
-            row["status"] = "skipped_rr"
+        legout = int(times.searchsorted(z.legout_time))
+        confirmed = impulse_extreme(z.kind, h, l, swing_high, swing_low, legout, cfg.impulse_swing_strength)
+        if confirmed is None or confirmed[0] + 1 >= len(bars):
+            row["status"] = "no_impulse_extreme"
             continue
+        ready, extreme = confirmed
+        entry, stop, target = plan_trade(z, extreme, cfg, pip)
+        risk, reward = abs(entry - stop), (target - entry) * (1 if long else -1)
+        row.update(extreme=extreme, order_time=times.iat[ready + 1], entry=entry, stop=round(stop, 5),
+                   target=round(target, 5), risk_pips=round(risk / pip, 1), planned_rr=round(reward / risk, 2),
+                   spread_r=round(cfg.spread_pips * pip / risk, 3))
 
-        start = int(bars["time"].searchsorted(z.legout_time + zone_tf))
-        touch = ask["low"][start:] <= entry if long else bid["high"][start:] >= entry
+        early = ask["low"][legout + 1:ready + 1] <= entry if long else bid["high"][legout + 1:ready + 1] >= entry
+        if early.any():
+            row["status"] = "touched_before_order"
+            continue
+        if reward < cfg.min_reward_risk * risk:
+            row["status"], row["reason"] = "skipped_rr", f"{reward / risk:.2f}R"
+            continue
+        touch = ask["low"][ready + 1:] <= entry if long else bid["high"][ready + 1:] >= entry
         f = first_true(touch)
         if f is None:
             row["status"] = "untouched"
             continue
-        f += start
-        row["entry_time"], row["trend_at_touch"] = bars["time"].iat[f], trend_at[f]
-        if trend_at[f] != ("up" if long else "down"):
+        f += ready + 1
+        t = times.iat[f]
+        row["entry_time"] = t
+
+        ok, why = direction_check(long, d1["trend"][f], d1["last_bos"][f], h4["trend"][f], cfg)
+        row["reason"] = why
+        if not ok:
             row["status"] = "skipped_trend"
             continue
+        if (event := news_conflict(market.news, market.instrument, t, t + TIMEFRAMES["H1"], cfg)) is not None:
+            row["status"], row["reason"] = "skipped_news", f"{event['currency']} news at {event['time']}"
+            continue
+        if wicks[f] >= cfg.max_big_wicks:
+            row["status"], row["reason"] = "skipped_erratic", f"{int(wicks[f])} big wicks in {cfg.wick_lookback}"
+            continue
+        room = room_to_opposing(long, entry, t, market.all_zones)
+        row["room_r"] = round(room / risk, 2) if np.isfinite(room) else np.inf
+        if room < cfg.min_room_rr * risk:
+            row["status"] = "skipped_room"
+            continue
 
-        # Limit order: fills at the entry price, or better if the candle opens through it.
         fill = min(entry, ask["open"][f]) if long else max(entry, bid["open"][f])
-        side = bid if long else ask
-        if long:
-            stop_hit, target_hit = side["low"][f:] <= stop, side["high"][f:] >= target
-        else:
-            stop_hit, target_hit = side["high"][f:] >= stop, side["low"][f:] <= target
-        target_hit[0] = False  # can't tell whether the target came after the fill within the candle
-        s, t = first_true(stop_hit), first_true(target_hit)
+        e, result, exit_price = exit_after_fill(f, long, stop, target, bid, ask)
+        fills = [(fill, cfg.initial_fraction)]
+        add_times = []
+        want = "bullish" if long else "bearish"
+        for k in np.flatnonzero(h1_bos[f:e] == want) + f:  # BOS known at close of k, add at open of k + 1
+            if len(add_times) >= cfg.max_adds or k + 1 > e:
+                break
+            price = ask["open"][k + 1] if long else bid["open"][k + 1]
+            if (stop < price < target) if long else (target < price < stop):
+                fills.append((price, cfg.add_fraction))
+                add_times.append(times.iat[k + 1])
 
-        if s is None and t is None:
-            e, result, exit_price = len(bars) - 1, "open_at_end", side["close"][-1] if long else c[-1] + half
-        else:
-            e = min(x for x in (s, t) if x is not None) + f
-            gap_open = side["open"][e]
-            opened_at_target = e > f and (gap_open >= target if long else gap_open <= target)
-            if t is not None and t + f == e and (s is None or s + f != e or opened_at_target):
-                result, exit_price = "win", max(target, gap_open) if long else min(target, gap_open)
-            else:
-                result = "loss"
-                gapped = e > f and (gap_open <= stop if long else gap_open >= stop)
-                exit_price = gap_open if gapped else stop
-
-        move = exit_price - fill if long else fill - exit_price
-        row.update(status="filled", fill_price=round(fill, 5), exit_time=bars["time"].iat[e],
-                   exit_price=round(exit_price, 5), result=result, pips=round(move / pip, 1),
-                   r_multiple=round(move / abs(fill - stop), 3))
+        sign = 1 if long else -1
+        r_setup = sum(frac * sign * (exit_price - p) / abs(p - stop) for p, frac in fills)
+        row.update(status="filled", fill_price=round(fill, 5), adds=len(add_times),
+                   add_times=";".join(f"{x:%Y-%m-%d %H:%M}" for x in add_times), exit_time=times.iat[e],
+                   exit_price=round(exit_price, 5), result=result,
+                   pips=round(sign * (exit_price - fill) / pip, 1), r_multiple=round(r_setup, 3))
     return pd.DataFrame(out)
 
 
 def summarize(trades, cfg):
-    filled = trades[trades["status"] == "filled"].sort_values("exit_time")
-    r = filled["r_multiple"].to_numpy()
+    filled = trades[trades["status"] == "filled"].sort_values("exit_time") if "status" in trades else trades
+    r = filled["r_multiple"].to_numpy(dtype=float)
     equity = cfg.starting_equity * np.cumprod(1 + cfg.risk_per_trade * r)
     curve = np.concatenate([[cfg.starting_equity], equity])
     drawdown = 1 - curve / np.maximum.accumulate(curve)
@@ -149,68 +222,69 @@ def summarize(trades, cfg):
         "expectancy_r": round(r.mean(), 3) if len(r) else 0.0,
         "total_return_%": round(100 * (curve[-1] / cfg.starting_equity - 1), 2),
         "max_drawdown_%": round(100 * drawdown.max(), 2),
+        "avg_adds": round(filled["adds"].mean(), 2) if len(r) and "adds" in filled else 0.0,
         "zones": len(trades),
-        "skipped_rr": int(counts.get("skipped_rr", 0)),
-        "skipped_trend": int(counts.get("skipped_trend", 0)),
-        "untouched": int(counts.get("untouched", 0)),
+        **{s: int(counts.get(s, 0)) for s in ("touched_before_order", "skipped_rr", "skipped_trend",
+                                              "skipped_news", "skipped_erratic", "skipped_room", "untouched")},
     }
 
 
 def load(instrument, granularity, before):
     path = DATA_DIR / f"{instrument}_{granularity}.csv"
     if not path.exists():
-        sys.exit(f"Error: {path} not found. Run fetch_candles.py first.")
+        sys.exit(f"Error: {path} not found. Run: python fetch_candles.py --granularity {granularity}")
     df = pd.read_csv(path, parse_dates=["time"])
-    return df[df["time"] < before].reset_index(drop=True)
+    # Keep only candles that had closed before the split.
+    return df[df["time"] + TIMEFRAMES[granularity] <= before].reset_index(drop=True)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--instrument", default="EUR_USD")
-    parser.add_argument("--zones-tf", nargs="+", default=["H1", "H4"], choices=list(TIMEFRAMES))
     parser.add_argument("--spread", type=float, default=BacktestConfig.spread_pips, help="pips")
     parser.add_argument("--risk", type=float, default=BacktestConfig.risk_per_trade,
-                        help="fraction of equity risked per trade")
+                        help="full per-trade risk as a fraction of equity")
     parser.add_argument("--in-sample-months", type=int, default=18)
     args = parser.parse_args()
 
     pip = pip_size(args.instrument)
     first = pd.read_csv(DATA_DIR / f"{args.instrument}_H1.csv", nrows=1, parse_dates=["time"])["time"].iat[0]
     split = (first + pd.DateOffset(months=args.in_sample_months)).normalize()
-    bars = load(args.instrument, "H1", split)
-    h4 = load(args.instrument, "H4", split)
-    print(f"In-sample: {bars['time'].iat[0]:%Y-%m-%d} -> {bars['time'].iat[-1]:%Y-%m-%d %H:%M} UTC "
-          f"({len(bars):,} H1 bars). Held out for validation: everything from {split:%Y-%m-%d}.")
-    print(f"Spread {args.spread} pips, risk {args.risk:.1%} per trade, compounding.\n")
-
-    structure = market_structure(h4, StructureConfig())
-    structure["available_time"] = structure["time"] + TIMEFRAMES["H4"]
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    structure.to_csv(OUT_DIR / f"{args.instrument}_H4_structure.csv", index=False)
-    share = structure["trend"].value_counts(normalize=True).mul(100).round(1)
-    print(f"H4 trend share: {share.to_dict()} | BOS events: "
-          f"{(structure['bos'] == 'bullish').sum()} bullish, {(structure['bos'] == 'bearish').sum()} bearish\n")
+    h1, h4, d1 = (load(args.instrument, g, split) for g in ("H1", "H4", "D"))
+    news = load_news(NEWS_PATH)
+    print(f"In-sample: {h1['time'].iat[0]:%Y-%m-%d} -> {h1['time'].iat[-1]:%Y-%m-%d %H:%M} UTC "
+          f"({len(h1):,} H1 bars). Held out for validation: everything from {split:%Y-%m-%d}.")
+    print(f"Spread {args.spread} pips, full risk {args.risk:.1%} per setup (entries of 1/3), compounding.")
+    print(f"News filter: {f'{len(news)} high-impact events' if news is not None else 'off (no data/news_events.csv)'}\n")
 
     base_cfg = BacktestConfig(spread_pips=args.spread, risk_per_trade=args.risk)
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
     grid = []
-    for tf in args.zones_tf:
-        candles = h4 if tf == "H4" else bars
-        for multiple, buffer in itertools.product(MULTIPLES, BUFFERS):
-            zones = detect_zones(candles, ZoneConfig(legout_multiple=multiple), pip=pip)
+    for multiple in MULTIPLES:
+        market, zones = build_market(h1, h4, d1, ZoneConfig(legout_multiple=multiple), args.instrument, pip, news)
+        if multiple == 2.5:
+            for name, s in (("D1 trend", market.d1), ("H4 momentum", market.h4)):
+                share = s["trend"].value_counts(normalize=True).mul(100).round(1).to_dict()
+                print(f"{name} share: {share}")
+            print()
+        for buffer in BUFFERS:
             cfg = replace(base_cfg, atr_buffer=buffer)
-            trades = simulate(zones, bars, structure[["available_time", "trend"]], cfg, TIMEFRAMES[tf], pip)
-            trades.to_csv(OUT_DIR / f"trades_{args.instrument}_{tf}_m{multiple}_b{buffer}.csv", index=False)
-            grid.append({"zones_tf": tf, "multiple": multiple, "atr_buffer": buffer, **summarize(trades, cfg)})
+            trades = simulate(zones, market, cfg, pip)
+            trades.to_csv(OUT_DIR / f"trades_{args.instrument}_H1_m{multiple}_b{buffer}.csv", index=False)
+            filled = trades[trades["status"] == "filled"]
+            lol = filled[filled["level_on_level"]]
+            grid.append({"multiple": multiple, "atr_buffer": buffer, **summarize(trades, cfg),
+                         "lol_trades": len(lol),
+                         "lol_expectancy_r": round(lol["r_multiple"].mean(), 3) if len(lol) else np.nan})
 
     results = pd.DataFrame(grid)
     results.to_csv(OUT_DIR / "grid_results.csv", index=False)
-    pd.set_option("display.width", 200)
-    cols = ["zones_tf", "multiple", "atr_buffer", "trades", "win_rate_%", "avg_planned_rr", "avg_win_r",
-            "avg_loss_r", "expectancy_r", "total_return_%", "max_drawdown_%"]
-    for tf in args.zones_tf:
-        base = results[(results["zones_tf"] == tf) & (results["multiple"] == 2.5) & (results["atr_buffer"] == 0.1)]
-        print(f"== Baseline, {tf} zones (multiple 2.5, buffer 0.1 ATR)")
-        print(base.drop(columns=["zones_tf", "multiple", "atr_buffer"]).T.to_string(header=False), "\n")
+    pd.set_option("display.width", 250)
+    base = results[(results["multiple"] == 2.5) & (results["atr_buffer"] == 0.1)]
+    print("== Baseline (multiple 2.5, buffer 0.1 ATR)")
+    print(base.drop(columns=["multiple", "atr_buffer"]).T.to_string(header=False), "\n")
+    cols = ["multiple", "atr_buffer", "trades", "win_rate_%", "avg_planned_rr", "avg_win_r", "avg_loss_r",
+            "expectancy_r", "total_return_%", "max_drawdown_%", "avg_adds", "lol_trades", "lol_expectancy_r"]
     print("== Parameter grid")
     print(results[cols].to_string(index=False))
     print(f"\nTrade logs and grid_results.csv in {OUT_DIR.relative_to(ROOT)}/")

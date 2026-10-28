@@ -2,89 +2,93 @@ import pandas as pd
 import pytest
 
 from backtest import BacktestConfig, simulate, summarize
+from helpers import AWAY, LOSS, SETUP, T0, TOUCH, WIN, bars, lifecycle_zone, market, zone
 
 PIP = 0.0001
+NO_SPREAD = BacktestConfig(spread_pips=0)
 
 
-def bars(rows):
-    times = pd.date_range("2025-01-06", periods=len(rows), freq="h", tz="UTC")
-    return pd.DataFrame(rows, columns=["open", "high", "low", "close"]).assign(time=times)
-
-
-def trend(times, label):
-    return pd.DataFrame({"available_time": [times.iloc[0]], "trend": [label]})
-
-
-def demand_zone(t0, top=1.1000, bottom=1.0990, impulse_pips=60, atr_pips=10):
-    return pd.DataFrame([{
-        "start_time": t0, "legout_time": t0, "type": "RBR", "kind": "demand",
-        "top": top, "bottom": bottom, "base_candles": 1,
-        "impulse_pips": impulse_pips, "impulse_ratio": 3.0, "impulse_atr": 3.0, "atr_pips": atr_pips,
-    }])
-
-
-AWAY = (1.1030, 1.1040, 1.1025, 1.1035)
-TOUCH = (1.1010, 1.1012, 1.0995, 1.1005)
-
-
-def run(rows, cfg=BacktestConfig(spread_pips=0), label="up", zone=None):
+def run(rows, cfg=NO_SPREAD, z=None, **market_kw):
     b = bars(rows)
-    z = demand_zone(b["time"].iloc[0]) if zone is None else zone
-    return simulate(z, b, trend(b["time"], label), cfg, zone_tf=pd.Timedelta("1h"), pip=PIP)
+    zones = pd.DataFrame([z or zone()])
+    return simulate(zones, market(b, **market_kw), cfg, PIP).iloc[0]
 
 
-def test_long_hits_target():
-    win = (1.1010, 1.1060, 1.1005, 1.1055)  # target = 1.1000 + 0.8 * 60 pips = 1.1048
-    t = run([AWAY, AWAY, TOUCH, win]).iloc[0]
+def test_first_entry_hits_target_measured_from_origin():
+    t = run(SETUP + [TOUCH, WIN])
     assert t.status == "filled" and t.result == "win"
-    assert (t.entry, t.target) == (1.1000, pytest.approx(1.1048))
-    assert t.stop == pytest.approx(1.0990 - 0.1 * 10 * PIP)
-    assert t.r_multiple == pytest.approx(48 / 11, abs=1e-3)
+    assert t.order_time == T0 + pd.Timedelta(hours=6)  # after the impulse high is confirmed
+    assert (t.entry, t.stop, t.target) == (1.1000, pytest.approx(1.0989), pytest.approx(1.1038))
+    assert t.r_multiple == pytest.approx(38 / 11 / 3, abs=1e-3)  # one-third position
 
 
-def test_long_hits_stop():
-    loss = (1.1000, 1.1002, 1.0980, 1.0985)
-    t = run([AWAY, AWAY, TOUCH, loss]).iloc[0]
-    assert t.result == "loss" and t.r_multiple == pytest.approx(-1)
+def test_stop_out_with_first_entry_only_loses_a_third():
+    t = run(SETUP + [TOUCH, LOSS])
+    assert t.result == "loss" and t.r_multiple == pytest.approx(-1 / 3, abs=1e-3)
 
 
-def test_stop_wins_tie_when_bar_hits_both():
-    both = (1.1010, 1.1060, 1.0980, 1.1000)
-    assert run([AWAY, AWAY, TOUCH, both]).iloc[0].result == "loss"
+def test_add_on_bullish_h1_bos_after_fill():
+    rows = SETUP + [TOUCH, WIN]
+    bos = [""] * 7 + ["bullish", ""]  # BOS at the close of the fill candle -> add at next open (1.1010)
+    t = run(rows, h1_bos=bos)
+    assert t.adds == 1
+    assert t.r_multiple == pytest.approx(38 / 11 / 3 + 28 / 21 / 3, abs=1e-3)
+
+
+def test_touch_before_impulse_confirmed_burns_zone():
+    early = (1.1045, 1.1046, 1.0999, 1.1035)  # dips into the zone at bar 4, before the order exists
+    assert run(SETUP[:4] + [early] + SETUP[5:] + [TOUCH, WIN]).status == "touched_before_order"
+
+
+def test_needs_d1_trend_and_h4_momentum():
+    assert run(SETUP + [TOUCH, WIN], d1_trend="down").status == "skipped_trend"
+    assert run(SETUP + [TOUCH, WIN], h4_trend="sideways").status == "skipped_trend"
+
+
+def test_countertrend_allowed_after_d1_bos():
+    t = run(SETUP + [TOUCH, WIN], d1_trend="sideways", d1_bos="bullish")
+    assert t.status == "filled" and "countertrend" in t.reason
+    assert run(SETUP + [TOUCH, WIN], d1_trend="sideways", d1_bos="bearish").status == "skipped_trend"
+    no_ct = BacktestConfig(spread_pips=0, allow_countertrend_with_bos=False)
+    assert run(SETUP + [TOUCH, WIN], no_ct, d1_trend="sideways", d1_bos="bullish").status == "skipped_trend"
+
+
+def test_opposing_zone_too_close_is_skipped():
+    supply = lifecycle_zone("supply", top=1.1020, bottom=1.1010)  # 10 pips above entry, stop is 11 pips
+    t = run(SETUP + [TOUCH, WIN], zones=[supply])
+    assert t.status == "skipped_room" and t.room_r == pytest.approx(10 / 11, abs=0.01)
+    broken = lifecycle_zone("supply", top=1.1020, bottom=1.1010, broken=T0)
+    assert run(SETUP + [TOUCH, WIN], zones=[broken]).status == "filled"
+
+
+def test_news_window_skips_trade():
+    news = pd.DataFrame({"time": [T0 + pd.Timedelta(hours=7, minutes=10)], "currency": ["USD"], "impact": ["high"]})
+    assert run(SETUP + [TOUCH, WIN], news=news).status == "skipped_news"
+    other = news.assign(currency="JPY")
+    assert run(SETUP + [TOUCH, WIN], news=other).status == "filled"
+
+
+def test_erratic_market_is_skipped():
+    assert run(SETUP + [TOUCH, WIN], BacktestConfig(spread_pips=0, max_big_wicks=0)).status == "skipped_erratic"
+
+
+def test_low_reward_to_risk_is_skipped():
+    assert run(SETUP + [TOUCH, WIN], BacktestConfig(spread_pips=0, min_reward_risk=4)).status == "skipped_rr"
 
 
 def test_spread_can_prevent_fill():
     graze = (1.1010, 1.1012, 1.1000, 1.1005)  # mid low exactly at entry; ask stays above it
-    assert run([AWAY, graze], BacktestConfig(spread_pips=0)).iloc[0].status == "filled"
-    assert run([AWAY, graze], BacktestConfig(spread_pips=1.0)).iloc[0].status == "untouched"
-
-
-def test_spread_is_paid_through_bid_ask_fills():
-    win = (1.1010, 1.1060, 1.1005, 1.1055)
-    with_spread = run([AWAY, AWAY, TOUCH, win], BacktestConfig(spread_pips=1.0)).iloc[0]
-    assert with_spread.result == "win"
-    assert with_spread.r_multiple == pytest.approx(48 / 11, abs=1e-3)  # limit fills at quoted prices
-    assert with_spread.spread_r == pytest.approx(1 / 11, abs=1e-3)
-
-
-def test_counter_trend_touch_is_skipped_and_burns_zone():
-    t = run([AWAY, TOUCH, (1.1010, 1.1060, 1.1005, 1.1055)], label="down").iloc[0]
-    assert t.status == "skipped_trend"
-
-
-def test_low_reward_to_risk_is_skipped():
-    z = demand_zone(bars([AWAY])["time"].iloc[0], impulse_pips=20)  # 16-pip target vs 11-pip stop
-    assert run([AWAY, TOUCH], zone=z).iloc[0].status == "skipped_rr"
+    assert run(SETUP + [graze]).status == "filled"
+    assert run(SETUP + [graze], BacktestConfig(spread_pips=1.0)).status == "untouched"
 
 
 def test_summary_metrics():
     times = pd.date_range("2025-01-06", periods=4, freq="h", tz="UTC")
     trades = pd.DataFrame({
         "status": ["filled"] * 4, "exit_time": times,
-        "r_multiple": [2.0, -1.0, -1.0, 3.0], "planned_rr": [2.0, 2.0, 2.0, 3.0],
+        "r_multiple": [2.0, -1.0, -1.0, 3.0], "planned_rr": [2.0, 2.0, 2.0, 3.0], "adds": [0, 1, 2, 0],
     })
     s = summarize(trades, BacktestConfig(risk_per_trade=0.01))
-    assert s["trades"] == 4 and s["win_rate_%"] == 50.0
-    assert s["avg_planned_rr"] == 2.25
+    assert s["trades"] == 4 and s["win_rate_%"] == 50.0 and s["avg_adds"] == 0.75
     assert s["total_return_%"] == pytest.approx((1.02 * 0.99 * 0.99 * 1.03 - 1) * 100, abs=0.01)
     assert s["max_drawdown_%"] == pytest.approx(1.99, abs=0.01)

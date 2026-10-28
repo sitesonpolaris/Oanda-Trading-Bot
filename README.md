@@ -92,37 +92,57 @@ python detect_zones.py --plot-at "2026-03-12 14:00"   # chart the zone nearest a
 
 ## Market structure (`structure.py`)
 
-On H4: swing highs/lows are 5-candle fractals (2 candles each side), only known
+On any timeframe (D1 trend, H4 momentum, H1 adds): swing highs/lows are 5-candle fractals (2 candles each side), only known
 once those candles close. Trend is **up** (higher high + higher low), **down**
 (lower high + lower low) or **sideways** (mixed). A **break of structure** is a
 close beyond the most recent swing high (bullish) or swing low (bearish); a BOS
 against the trend turns it sideways until the next swing forms.
 
+## Strategy (`strategy.py`)
+
+Implements the strategy spec (Oct 10, 2026). The same rules drive the backtest
+and the live bot.
+
+- **Timeframes:** trend on D1, momentum on H4, zones and entries on H1.
+- **Direction:** H4 momentum must agree with the trade, and so must the D1 trend.
+  A countertrend trade is allowed only once a D1 break of structure has
+  neutralised the opposing trend.
+- **Zone edges:** entry at the wick (single-candle base) or body (multi-candle
+  base); stop beyond the base's wick extreme + 0.1 × ATR.
+- **Target:** 80% of the impulse, measured from the zone's origin (far edge) to
+  the impulse extreme. The limit order goes in once an H1 swing confirms that
+  extreme; a zone touched before then is used up.
+- **Playing field:** skip if the nearest active opposing zone (H1 or H4) is
+  closer than 2× the stop distance; skip if 5+ of the last 20 H1 candles have
+  wicks ≥ 1× ATR; skip within 30 min of high-impact news for either currency.
+  The news filter needs `data/news_events.csv` (`time,currency,impact`, UTC)
+  and is off without it.
+- **Sizing:** the first entry risks ⅓ of the per-trade risk. Up to two more ⅓
+  entries are added at market after H1 breaks of structure in the trade's
+  favour, with the same stop and target. Stops are never tightened.
+- **Level-on-level:** zones stacked on another same-side zone are flagged and
+  get priority.
+
+All settings live in `StrategyConfig`.
+
 ## Backtest
 
 ```bash
+python fetch_candles.py --granularity D    # daily candles, needed for the trend
 python backtest.py
 ```
 
 - Uses only the **first 18 months** of data; the rest is cut off before anything
   is computed and kept for validation.
-- Demand zones are traded only in an H4 uptrend, supply zones only in a downtrend
-  (trend as of the last closed H4 candle).
-- Limit entry at the zone's near edge on the first return to a fresh zone. That
-  first touch uses up the zone, traded or not.
-- Stop: far edge + 0.1 × ATR. Target: 80% of the leg-out range from entry.
-  Skipped if target < 2 × stop distance.
 - Simulated on H1 candles with a 1.2-pip spread (buys fill on the ask, sells on
-  the bid). If a candle hits stop and target, the stop counts first.
-- 1% risk per trade, compounding, for return and drawdown.
-- Runs the baseline plus a grid of ATR buffer 0.1 / 0.2 / 0.25 × leg-out multiple
-  2 / 2.5 / 3, for H1 and H4 zones.
+  the bid, adds included). If a candle hits stop and target, the stop counts
+  first. Weekend gaps fill at the gap price.
+- Results are in R of the full per-trade risk (1% by default): a stop-out with
+  only the first entry is −⅓R.
+- Grid: ATR buffer 0.1 / 0.2 / 0.25 × leg-out multiple 2 / 2.5 / 3.
 
-Output in `output/backtest/`: `trades_<instrument>_<tf>_m<multiple>_b<buffer>.csv`
-(every zone with entry, stop, target, fill, exit, result, R), `grid_results.csv`,
-and `<instrument>_H4_structure.csv` (trend and BOS per H4 candle).
-
-Options: `--spread 1.0`, `--risk 0.005`, `--zones-tf H1`, `--in-sample-months 18`.
+Output in `output/backtest/`: `trades_<instrument>_H1_m<multiple>_b<buffer>.csv`
+(every zone: plan, filter verdict, fill, adds, exit, R) and `grid_results.csv`.
 
 ## Risk manager (`risk_manager.py`)
 
@@ -176,11 +196,10 @@ Places risk-approved orders on the **practice** account.
 ## Main loop (`bot.py`)
 
 Runs once per H1 candle close. Each cycle it syncs the account, checks the risk
-limits (a halt cancels pending orders), pulls 90 days of H1/H4 candles, updates
-the H4 trend and H1 zones, and cancels pending orders whose zone was touched or
-no longer matches the trend, or that are older than 24 candles. Then it passes
-each new signal through the risk manager and sends approved orders to the
-executioner. A setup is only ever traded once.
+limits (a halt cancels pending orders), pulls D1/H4/H1 candles, applies the
+strategy rules, and cancels pending orders whose zone no longer passes, or that are older than
+24 candles. It then passes each new signal (level-on-level first) and each
+scale-in through the risk manager and sends approved orders to the executioner. A setup is only ever traded once.
 
 ```bash
 python bot.py --once                        # one dry-run cycle now

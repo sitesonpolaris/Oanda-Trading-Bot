@@ -1,6 +1,7 @@
-"""Main loop: once per H1 candle close, pull data, find zones and trend, generate
-signals, pass them through the risk manager, and hand approved orders to the
-executioner. Practice account only.
+"""Main loop: once per H1 candle close, pull D1/H4/H1 data, find zones, trend and
+momentum, generate signals (strategy.py rules, same as the backtest), pass them
+through the risk manager, and hand approved orders to the executioner.
+Practice account only.
 
 Dry run is the default: everything runs, including reads from the practice
 account, but no orders are placed or cancelled. Use --send-orders to place them.
@@ -23,13 +24,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from backtest import TIMEFRAMES, BacktestConfig
+from backtest import TIMEFRAMES, BacktestConfig, build_market, NEWS_PATH
 from executioner import Executioner, RefuseToRun, client_order_id, make_client, resolve_environment
 from fetch_candles import fetch_candles
 from risk_manager import AccountState, Position, RiskLimits, RiskManager
-from signals import evaluate_zones
-from structure import StructureConfig, market_structure
-from zones import ZoneConfig, detect_zones, pip_size
+from signals import add_signals, evaluate_zones
+from strategy import load_news
+from structure import StructureConfig
+from zones import ZoneConfig, pip_size
 
 ROOT = Path(__file__).resolve().parent
 LOG_PATH = ROOT / "logs" / "bot.log"
@@ -41,9 +43,8 @@ log = logging.getLogger("bot")
 @dataclass
 class BotConfig:
     instrument: str = "EUR_USD"
-    zone_tf: str = "H1"
-    lookback_days: int = 90                # history pulled each cycle for zones and swings
-    max_order_age_candles: int = 24        # cancel unfilled limit orders after this many zone_tf candles
+    lookback_days: dict = field(default_factory=lambda: {"H1": 90, "H4": 180, "D": 400})
+    max_order_age_candles: int = 24        # cancel unfilled limit orders after this many H1 candles
     daily_reset_tz: str = "UTC"            # PLACEHOLDER: the prop firm's daily reset time zone
     starting_balance: float | None = None  # PLACEHOLDER: challenge start; None = balance on first run
     candle_close_delay_s: int = 20         # wait after the close so OANDA marks the candle complete
@@ -107,7 +108,7 @@ class Bot:
     def cycle(self, now=None):
         cfg = self.cfg
         now = now or datetime.now(timezone.utc)
-        log.info("===== Cycle %s | %s | %s zones, H4 trend =====", f"{now:%Y-%m-%d %H:%M}", self.ex.mode, cfg.zone_tf)
+        log.info("===== Cycle %s | %s | D1 trend, H4 momentum, H1 zones =====", f"{now:%Y-%m-%d %H:%M}", self.ex.mode)
 
         book = self.ex.sync()
         account = self.account_state(book, now)
@@ -124,37 +125,41 @@ class Bot:
             return
 
         end = now.replace(minute=0, second=0, microsecond=0)
-        start = end - timedelta(days=cfg.lookback_days)
-        h1 = closed_by(fetch_candles(self.client, cfg.instrument, "H1", start, end), "H1", now)
-        h4 = closed_by(fetch_candles(self.client, cfg.instrument, "H4", start, end), "H4", now)
-        log.info("Data: %d H1 candles (last %s), %d H4 candles (last %s)", len(h1),
-                 f"{h1['time'].iat[-1]:%Y-%m-%d %H:%M}", len(h4), f"{h4['time'].iat[-1]:%Y-%m-%d %H:%M}")
+        candles = {g: closed_by(fetch_candles(self.client, cfg.instrument, g, end - timedelta(days=days), end), g, now)
+                   for g, days in cfg.lookback_days.items()}
+        log.info("Data: %s", ", ".join(f"{len(df)} {g} (last {df['time'].iat[-1]:%Y-%m-%d %H:%M})"
+                                       for g, df in candles.items()))
 
-        structure = market_structure(h4, cfg.structure)
-        structure["available_time"] = structure["time"] + TIMEFRAMES["H4"]
-        last = structure.iloc[-1]
-        log.info("H4 trend: %s | last swing high %.5f, last swing low %.5f | last BOS: %s", last.trend,
-                 last.last_swing_high, last.last_swing_low, _last_bos(structure))
+        news = load_news(NEWS_PATH)
+        market, zones = build_market(candles["H1"], candles["H4"], candles["D"], cfg.zones, cfg.instrument,
+                                     self.pip, news, cfg.structure)
+        for name, structure in (("D1 trend", market.d1), ("H4 momentum", market.h4)):
+            last = structure.iloc[-1]
+            log.info("%s: %s | last swing high %.5f, low %.5f | last BOS: %s", name, last.trend,
+                     last.last_swing_high, last.last_swing_low, _last_bos(structure))
+        if news is None:
+            log.info("News filter off: no %s", NEWS_PATH.relative_to(ROOT))
 
-        candles = h1 if cfg.zone_tf == "H1" else h4
-        zones = detect_zones(candles, cfg.zones, pip=self.pip)
-        verdicts = evaluate_zones(zones, h1, structure, cfg.trade, cfg.instrument, cfg.zone_tf, self.pip, now)
-        counts = {s: sum(v.status == s for v in verdicts) for s in ("signal", "touched", "skipped_trend", "skipped_rr")}
-        log.info("Zones: %d detected in %d days | %s", len(zones), cfg.lookback_days, counts)
+        verdicts = evaluate_zones(zones, market, cfg.trade, self.pip, now)
+        counts = {}
+        for v in verdicts:
+            counts[v.status] = counts.get(v.status, 0) + 1
+        log.info("H1 zones: %d in %d days | %s", len(zones), cfg.lookback_days["H1"], counts)
         for v in verdicts:
             log.debug("  zone %s %s: %s", v.setup_id, v.status, v.detail)
 
         self.manage_pending(book, {v.setup_id: v for v in verdicts}, now)
         self.handle_signals([v for v in verdicts if v.status == "signal"], book, account)
+        self.handle_adds(add_signals(book.trades, market, cfg.trade, now), account)
 
     def manage_pending(self, book, verdicts, now):
-        max_age = TIMEFRAMES[self.cfg.zone_tf] * self.cfg.max_order_age_candles
+        max_age = TIMEFRAMES["H1"] * self.cfg.max_order_age_candles
         for o in book.pending:
             v = verdicts.get(o.setup_id)
             if v is None or v.status != "signal":
                 self.ex.cancel(o, f"zone invalidated: {v.status if v else 'zone no longer detected'}")
             elif now - o.created >= max_age:
-                self.ex.cancel(o, f"unfilled after {self.cfg.max_order_age_candles} {self.cfg.zone_tf} candles")
+                self.ex.cancel(o, f"unfilled after {self.cfg.max_order_age_candles} H1 candles")
             else:
                 log.info("Keeping %s: zone still valid, age %s", o.client_id, now - o.created)
 
@@ -177,6 +182,17 @@ class Bot:
             decision = self.rm.evaluate(s, account)
             log.info("Signal %s %s %s -> risk manager: %s (%s)", s.setup_id, s.side, v.detail,
                      decision.reason.upper(), decision.detail)
+            if decision.approved:
+                o = decision.order
+                self.ex.place(o)
+                account.open_positions.append(
+                    Position(o.instrument, o.side, o.units, o.entry, o.stop, o.setup_id, s.time))
+
+    def handle_adds(self, signals, account):
+        for s in signals:
+            decision = self.rm.evaluate(s, account)
+            log.info("Scale-in %s %s at market ~%.5f after H1 BOS %s -> risk manager: %s (%s)", s.setup_id, s.side,
+                     s.entry, f"{s.bos_time:%Y-%m-%d %H:%M}", decision.reason.upper(), decision.detail)
             if decision.approved:
                 o = decision.order
                 self.ex.place(o)

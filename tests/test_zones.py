@@ -42,10 +42,12 @@ def test_single_candle_base_uses_wick_edges():
     assert z.base_candles == 1
 
 
-def test_multi_candle_base_uses_body_edges():
+def test_multi_candle_base_entry_at_body_stop_side_at_wick():
     df = frame(history() + [RALLY_IN, BASE_A, BASE_B, RALLY_OUT])
     z = detect_zones(df).iloc[0]
-    assert (z.top, z.bottom) == (1.1003, 1.1000)
+    assert (z.top, z.bottom) == (1.1003, 1.0995)  # demand: entry = body top, far edge = lowest wick
+    supply = detect_zones(frame(history() + [DROP_IN, BASE_A, BASE_B, DROP_OUT])).iloc[0]
+    assert (supply.top, supply.bottom) == (1.1008, 1.1000)  # supply: entry = body bottom, far = highest wick
     assert z.base_candles == 2
     assert z.start_time == df["time"].iloc[-3]  # first base candle
 

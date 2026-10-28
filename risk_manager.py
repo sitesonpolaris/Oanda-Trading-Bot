@@ -4,6 +4,10 @@
 Order with a position size, or a rejection with a reason. It never talks to the
 broker; the caller supplies the current account state.
 
+Sizing: the first entry on a setup risks `initial_entry_fraction` of the full
+per-trade risk; each scale-in risks `add_entry_fraction`, capped by whatever room
+is left under the full risk for that setup.
+
 Checks, in order (first failure wins):
     halted                     bot was halted earlier and hasn't been reset
     daily_loss_limit           today's loss reached the halt line -> halts the bot
@@ -40,7 +44,9 @@ DEFAULT_STATE_PATH = Path(__file__).resolve().parent / "state" / "risk_state.jso
 @dataclass
 class RiskLimits:
     """All values are percentages. PLACEHOLDERS for the prop firm values - replace with the real rules."""
-    risk_per_trade_pct: float = 0.5        # loss at stop, % of current balance; also the per-setup cap
+    risk_per_trade_pct: float = 0.5        # full risk per setup, % of current balance (cap for all entries)
+    initial_entry_fraction: float = 1 / 3  # first entry risks this share of the full risk
+    add_entry_fraction: float = 1 / 3      # each scale-in risks this share (if room is left under the cap)
     firm_daily_loss_pct: float = 5.0       # PLACEHOLDER: firm's max daily loss, % of starting balance
     firm_max_drawdown_pct: float = 10.0    # PLACEHOLDER: firm's max total loss, % of starting balance
     safety_margin_pct: float = 1.0         # halt this many points before the firm's limits
@@ -74,6 +80,7 @@ class Signal:
     time: datetime
     bos_time: datetime | None = None  # latest break of structure in the trade's favour
     quote_to_account: float = 1.0     # account-currency value of 1 unit of quote currency
+    order_type: str = "LIMIT"         # LIMIT for zone entries, MARKET for scale-ins
 
 
 @dataclass
@@ -115,6 +122,7 @@ class Order:
     entry_number: int
     risk_amount: float
     risk_pct: float
+    order_type: str = "LIMIT"
 
     @property
     def oanda_units(self):
@@ -197,7 +205,8 @@ class RiskManager:
             return Decision(False, "invalid_signal", problem)
 
         same_setup = [p for p in account.open_positions if p.setup_id == signal.setup_id]
-        budget = account.balance * lim.risk_per_trade_pct / 100
+        full_risk = account.balance * lim.risk_per_trade_pct / 100
+        budget = full_risk * lim.initial_entry_fraction
         if same_setup:
             if len(same_setup) >= lim.max_entries_per_setup:
                 return Decision(False, "max_entries_per_setup",
@@ -206,7 +215,8 @@ class RiskManager:
             if signal.bos_time is None or signal.bos_time <= last_entry:
                 return Decision(False, "no_bos_confirmation",
                                 f"scale-in needs a favourable BOS after {last_entry:%Y-%m-%d %H:%M}")
-            budget -= sum(p.risk_amount for p in same_setup)
+            room = full_risk - sum(p.risk_amount for p in same_setup)
+            budget = min(full_risk * lim.add_entry_fraction, room)
             if budget <= 0:
                 return Decision(False, "setup_risk_cap",
                                 f"setup {signal.setup_id} already risks {lim.risk_per_trade_pct}% of balance")
@@ -236,7 +246,7 @@ class RiskManager:
 
         order = Order(signal.instrument, signal.side, units, signal.entry, signal.stop, signal.target,
                       signal.setup_id, len(same_setup) + 1, round(risk, 2),
-                      round(100 * risk / account.balance, 3))
+                      round(100 * risk / account.balance, 3), signal.order_type)
         return Decision(True, "approved", f"{units} units risking {risk:.2f}", order)
 
 

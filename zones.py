@@ -9,8 +9,9 @@ The candle before the base is the leg-in. Zone types:
     RBR  rally-base-rally  (demand)     DBR  drop-base-rally  (demand)
     DBD  drop-base-drop    (supply)     RBD  rally-base-drop  (supply)
 
-Zone edges: a single-candle base uses its wick high/low; a multi-candle base
-uses the highest and lowest candle body (open/close) across the base.
+Zone edges: the far edge (where the stop goes) is always the base's wick
+extreme. The near edge (entry) is the wick for a single-candle base and the
+body for a multi-candle base: top of the bodies for demand, bottom for supply.
 """
 
 from dataclasses import dataclass
@@ -81,14 +82,15 @@ def detect_zones(df, config=None, pip=0.0001):
             continue  # no base, or the consolidation runs longer than max_base_candles
 
         base = slice(i - n, i)
-        if n == 1:
-            top, bottom = h[i - 1], l[i - 1]
-        else:
-            top = max(o[base].max(), c[base].max())
-            bottom = min(o[base].min(), c[base].min())
-
         leg_in_dir = "R" if c[leg_in] > o[leg_in] else "D"
         leg_out_dir = "R" if c[i] > o[i] else "D"
+        # Far edge (stop side) is always the base's wick extreme; the near (entry) edge is the
+        # wick for a single-candle base and the body for a multi-candle base.
+        top, bottom = h[base].max(), l[base].min()
+        if n > 1 and leg_out_dir == "R":
+            top = max(o[base].max(), c[base].max())
+        elif n > 1:
+            bottom = min(o[base].min(), c[base].min())
         zones.append({
             "start_time": df["time"].iloc[i - n],
             "legout_time": df["time"].iloc[i],

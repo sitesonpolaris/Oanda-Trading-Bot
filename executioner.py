@@ -2,7 +2,7 @@
 
 - Refuses to run against anything but the practice environment unless live
   trading has been deliberately unlocked (see LIVE_TRADING_UNLOCKED below).
-- Places LIMIT orders with the stop loss and take profit attached to the order
+- Places LIMIT orders (MARKET for scale-ins) with the stop loss and take profit attached to the order
   (stopLossOnFill / takeProfitOnFill), so OANDA manages them, not this bot.
 - Never double-places: every order carries a deterministic client ID. Before
   each attempt, including retries after connection errors, OANDA is asked
@@ -105,6 +105,7 @@ class OpenTrade:
     stop: float
     opened: datetime
     unrealized_pl: float
+    target: float | None = None
 
     def as_position(self):
         return Position(self.instrument, "long" if self.units > 0 else "short", abs(self.units),
@@ -187,19 +188,23 @@ class Executioner:
         units = int(float(t["currentUnits"]))
         # No stop on the trade (e.g. opened by hand): treat the whole entry price as at risk.
         stop = float(stop) if stop else (0.0 if units > 0 else float(t["price"]) * 2)
+        target = t.get("takeProfitOrder", {}).get("price")
         return OpenTrade(t["id"], t.get("clientExtensions", {}).get("tag", "manual"), t["instrument"], units,
-                         float(t["price"]), stop, parse_time(t["openTime"]), float(t.get("unrealizedPL", 0)))
+                         float(t["price"]), stop, parse_time(t["openTime"]), float(t.get("unrealizedPL", 0)),
+                         float(target) if target else None)
 
     # --- actions --------------------------------------------------------------
 
     def order_request(self, order, client_id):
         ext = {"id": client_id, "tag": order.setup_id, "comment": f"entry {order.entry_number}"}
+        if order.order_type == "MARKET":  # scale-ins: fill now or not at all
+            entry = {"type": "MARKET", "timeInForce": "FOK"}
+        else:
+            entry = {"type": "LIMIT", "price": price_str(order.instrument, order.entry), "timeInForce": "GTC"}
         return {"order": {
-            "type": "LIMIT",
+            **entry,
             "instrument": order.instrument,
             "units": str(order.oanda_units),
-            "price": price_str(order.instrument, order.entry),
-            "timeInForce": "GTC",
             "positionFill": "DEFAULT",
             "stopLossOnFill": {"price": price_str(order.instrument, order.stop), "timeInForce": "GTC"},
             "takeProfitOnFill": {"price": price_str(order.instrument, order.target), "timeInForce": "GTC"},
@@ -211,7 +216,8 @@ class Executioner:
         """Place an approved order once. Returns the OANDA order dict, or None if not placed."""
         client_id = client_order_id(order.setup_id, order.entry_number)
         request = self.order_request(order, client_id)
-        summary = (f"{client_id} LIMIT {order.instrument} {order.oanda_units:+d} @ {request['order']['price']} "
+        at = request["order"].get("price", "market")
+        summary = (f"{client_id} {order.order_type} {order.instrument} {order.oanda_units:+d} @ {at} "
                    f"SL {request['order']['stopLossOnFill']['price']} "
                    f"TP {request['order']['takeProfitOnFill']['price']} (risk {order.risk_amount:.2f})")
         if self.dry_run:

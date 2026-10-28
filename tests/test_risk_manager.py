@@ -8,6 +8,7 @@ T0 = datetime(2026, 5, 4, 9, tzinfo=timezone.utc)
 LIMITS = RiskLimits(
     risk_per_trade_pct=0.5, firm_daily_loss_pct=5.0, firm_max_drawdown_pct=10.0,
     safety_margin_pct=1.0, max_open_positions=3, max_open_risk_pct=1.5,
+    initial_entry_fraction=1.0, add_entry_fraction=1.0,  # full-size entries keep the arithmetic simple
 )
 
 
@@ -48,7 +49,7 @@ def test_short_orders_have_negative_oanda_units(rm):
 
 
 def test_sizes_off_current_balance_and_converts_quote_currency(tmp_path):
-    rm = RiskManager(RiskLimits(risk_per_trade_pct=1.0), state_path=tmp_path / "s.json")
+    rm = RiskManager(RiskLimits(risk_per_trade_pct=1.0, initial_entry_fraction=1.0), state_path=tmp_path / "s.json")
     d = rm.evaluate(signal(quote_to_account=0.5), account(balance=96_000))
     assert d.order.units == 960_000  # 1% of current $96k = $960, / (0.0020 * 0.5)
 
@@ -67,7 +68,7 @@ def test_rejects_invalid_signal(rm, kw):
 
 
 def test_rejects_when_position_too_small(tmp_path):
-    rm = RiskManager(RiskLimits(min_units=1_000), state_path=tmp_path / "s.json")
+    rm = RiskManager(RiskLimits(min_units=1_000, initial_entry_fraction=1.0), state_path=tmp_path / "s.json")
     d = rm.evaluate(signal(stop=0.6), account())  # $500 over a 5000-pip stop = 1,000 units: just fits
     assert d.approved
     d = rm.evaluate(signal(stop=0.5), account())  # 833 units
@@ -170,3 +171,26 @@ def test_no_fourth_entry_on_a_setup(rm):
     entries = [position("zone-1", units=1_000, stop=1.1000, opened=T0 - timedelta(hours=h)) for h in (9, 6, 3)]
     add = signal(entry=1.1030, stop=1.1010, target=1.1090, bos_time=T0 - timedelta(hours=1))
     assert rm.evaluate(add, account(positions=entries)).reason == "max_entries_per_setup"
+
+
+# --- partial entries (spec: start with 1/3, add on BOS) ------------------------
+
+def test_default_first_entry_is_one_third_of_full_risk(tmp_path):
+    rm = RiskManager(RiskLimits(), state_path=tmp_path / "s.json")
+    d = rm.evaluate(signal(), account())
+    assert d.order.risk_amount == pytest.approx(500 / 3, abs=0.01) and d.order.units == 83_333
+
+
+def test_default_adds_are_one_third_each_and_stop_at_the_cap(tmp_path):
+    rm = RiskManager(RiskLimits(), state_path=tmp_path / "s.json")
+    bos = T0 - timedelta(hours=1)
+    add = signal(entry=1.1030, stop=1.0980, target=1.1090, bos_time=bos, order_type="MARKET")  # 50-pip stop
+    one = [position("zone-1", units=83_333, opened=T0 - timedelta(hours=5))]  # ~$166.67 at risk
+    d = rm.evaluate(add, account(positions=one))
+    assert d.approved and d.order.entry_number == 2 and d.order.order_type == "MARKET"
+    assert d.order.risk_amount == pytest.approx(500 / 3, abs=0.5)
+    two = one + [position("zone-1", units=33_333, entry=1.1030, opened=T0 - timedelta(hours=3))]
+    d = rm.evaluate(add, account(positions=two))
+    assert d.approved and d.order.entry_number == 3
+    full = two + [position("zone-1", units=34_000, entry=1.1030, opened=T0 - timedelta(hours=2))]
+    assert not rm.evaluate(add, account(positions=full)).approved
