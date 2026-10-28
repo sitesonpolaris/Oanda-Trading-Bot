@@ -50,6 +50,15 @@ class BacktestConfig:
     starting_equity: float = 10_000.0
 
 
+def plan_trade(zone, cfg, pip):
+    """Entry at the near edge, stop beyond the far edge + ATR buffer, target at a fraction of the impulse."""
+    buffer = cfg.atr_buffer * zone.atr_pips * pip
+    impulse = cfg.target_fraction * zone.impulse_pips * pip
+    if zone.kind == "demand":
+        return zone.top, zone.bottom - buffer, zone.top + impulse
+    return zone.bottom, zone.top + buffer, zone.bottom - impulse
+
+
 def first_true(mask):
     return int(np.argmax(mask)) if mask.any() else None
 
@@ -66,12 +75,7 @@ def simulate(zones, bars, trend, cfg, zone_tf, pip):
     out = []
     for z in zones.itertuples(index=False):
         long = z.kind == "demand"
-        buffer = cfg.atr_buffer * z.atr_pips * pip
-        impulse = cfg.target_fraction * z.impulse_pips * pip
-        if long:
-            entry, stop, target = z.top, z.bottom - buffer, z.top + impulse
-        else:
-            entry, stop, target = z.bottom, z.top + buffer, z.bottom - impulse
+        entry, stop, target = plan_trade(z, cfg, pip)
         risk, reward = abs(entry - stop), abs(target - entry)
         row = {
             "zone_start": z.start_time, "zone_type": z.type, "side": "long" if long else "short",

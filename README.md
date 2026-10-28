@@ -2,7 +2,7 @@
 
 Automated Forex trading bot for the **OANDA practice (fxTrade Practice) account only**.
 
-Current stage: **data feed, zone detection, market structure, backtest, risk manager** — no live trading or order code yet.
+Current stage: **full pipeline on the practice account, dry run by default.** The strategy still loses in backtest, so don't send orders expecting profit.
 
 ## Setup
 
@@ -156,6 +156,42 @@ python risk_manager.py reset
 
 **The prop firm values in `RiskLimits` are placeholders (5% daily, 10% total)
 until the real challenge rules are filled in.**
+
+## Executioner (`executioner.py`)
+
+Places risk-approved orders on the **practice** account.
+
+- **Practice only.** Starts only with `OANDA_ENVIRONMENT` unset or `practice`.
+  Live needs *both* `LIVE_TRADING_UNLOCKED = True` in `executioner.py` (a code
+  change) *and* `OANDA_ENVIRONMENT=live` plus `OANDA_LIVE_CONFIRM` set to the
+  exact phrase in that file.
+- **LIMIT orders** at the zone edge with `stopLossOnFill` and `takeProfitOnFill`,
+  so OANDA holds the stop and target.
+- **No double orders.** Each order has a fixed client ID
+  (`zb-<setup>-<entry number>`). Before every attempt, including retries after a
+  connection error, it asks OANDA whether that ID already exists.
+- **Retries** with exponential backoff on network errors, rate limits and 5xx.
+  Rejections (4xx) aren't retried.
+
+## Main loop (`bot.py`)
+
+Runs once per H1 candle close. Each cycle it syncs the account, checks the risk
+limits (a halt cancels pending orders), pulls 90 days of H1/H4 candles, updates
+the H4 trend and H1 zones, and cancels pending orders whose zone was touched or
+no longer matches the trend, or that are older than 24 candles. Then it passes
+each new signal through the risk manager and sends approved orders to the
+executioner. A setup is only ever traded once.
+
+```bash
+python bot.py --once                        # one dry-run cycle now
+python bot.py                               # dry run, every candle close
+python bot.py --as-of "2025-11-19 03:00"    # dry-run replay of a past candle close
+python bot.py --send-orders                 # place orders on the practice account
+```
+
+Everything is logged with UTC timestamps to `logs/bot.log` (per-zone detail at
+DEBUG level). State such as the starting balance and day-start balance is kept
+in `state/`. Settings live in `BotConfig` in `bot.py`.
 
 ## Tests
 
