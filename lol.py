@@ -17,8 +17,11 @@ Long (short is the mirror image):
      momentum signal, so the setup is traded even against the D1/H4 trend.
      Each setup records whether D1 and H4 agreed (`trend_aligned`), so aligned
      and countertrend setups can be compared.
+     Optionally, the RBR's base must start within `max_pause_candles` candles of
+     the break of structure.
   7. Target (when price comes back to the RBR): `target_fraction` (80%) of the
-     way to the nearest unbroken H1 supply zone above; if there is none, the
+     way to the nearest fresh H1 or H4 supply zone above (one price hasn't come
+     back to since it formed); if there is none, the
      RBR's move-out distance (top of the RBR to the high before the return)
      projected from the entry. Under `min_reward_risk`, no trade.
 
@@ -51,6 +54,8 @@ class LoLConfig:
     zones: ZoneConfig = field(default_factory=ZoneConfig)
     # The reversal zone doesn't need the move-out to be 2x the base.
     reversal_impulse_vs_base: float | None = None
+    # Most candles from the break of structure to the start of the RBR's base (None = no limit).
+    max_pause_candles: int | None = None
 
 
 def find_setups(h1, cfg=None, pip=0.0001):
@@ -83,6 +88,8 @@ def find_setups(h1, cfg=None, pip=0.0001):
             cont_out = int(times.searchsorted(cont.legout_time))
             if move_in < legout or cont_out <= bos:
                 continue  # the continuation must complete after the break of structure
+            if cfg.max_pause_candles is not None and move_in + 1 - bos > cfg.max_pause_candles:
+                break  # too long after the break of structure
             pause = slice(bos + 1, move_in + 1)
             failed = (c[pause] < level) if demand else (c[pause] > level)
             if failed.any():
@@ -94,9 +101,21 @@ def find_setups(h1, cfg=None, pip=0.0001):
                 "bos_time": times.iat[bos], "bos_level": level,
                 "cont_type": cont.type, "cont_start": cont.start_time, "cont_legout": cont.legout_time,
                 "cont_top": cont.top, "cont_bottom": cont.bottom, "cont_valid": cont.valid_time,
+                "pause_candles": move_in + 1 - bos,
             })
             break
     return pd.DataFrame(rows)
+
+
+def first_touch(zones, bars):
+    """When price first came back to each zone's entry edge after it became available (NaT: never)."""
+    times, high, low = bars["time"], bars["high"].to_numpy(), bars["low"].to_numpy()
+    touched = []
+    for z in zones.itertuples(index=False):
+        start = int(times.searchsorted(z.available_time)) if pd.notna(z.available_time) else len(bars)
+        hit = np.flatnonzero(high[start:] >= z.bottom if z.kind == "supply" else low[start:] <= z.top)
+        touched.append(times.iat[start + hit[0]] if len(hit) else pd.NaT)
+    return pd.Series(touched, index=zones.index, dtype=times.dtype)
 
 
 def simulate(setups, market, cfg, pip):
@@ -108,7 +127,8 @@ def simulate(setups, market, cfg, pip):
     ask = {"open": o + half, "high": h + half, "low": l + half, "close": c + half}
     daily_atr = pd.merge_asof(bars[["time"]], market.d1_atr.sort_values("available_time"),
                               left_on="time", right_on="available_time")["atr"].to_numpy()
-    h1_zones = market.all_zones[market.all_zones["tf"] == "H1"]
+    zones = market.all_zones[market.all_zones["tf"].isin(["H1", "H4"])]
+    touched = first_touch(zones, bars)
     d1, h4 = state_at_bars(bars, market.d1, ["trend"])["trend"], state_at_bars(bars, market.h4, ["trend"])["trend"]
     out = []
     for s in setups.itertuples(index=False):
@@ -135,7 +155,8 @@ def simulate(setups, market, cfg, pip):
             continue
         f += order
         t = times.iat[f]
-        opp = active_at(h1_zones, t)
+        opp = active_at(zones, t)
+        opp = opp[~(touched[opp.index] < t)]  # fresh: not touched before the entry candle
         if long:
             edges = opp.loc[(opp["kind"] == "supply") & (opp["bottom"] > entry), "bottom"]
         else:
