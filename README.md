@@ -65,6 +65,8 @@ How a zone is found (`zones.py`):
 
 1. ATR (14, Wilder) is calculated on each timeframe.
 2. A **basing candle** has a body ≤ 50% of its range and a range ≤ 1× ATR.
+   Only **strong** zones are kept: the move-out impulse is at least 2× the range
+   of the largest basing candle (`min_impulse_vs_base`).
 3. The **leg-out is an impulse candle**: a non-basing candle right after 1–5
    basing candles that closes outside the previous candle's range. Closing above
    the previous high makes a demand zone; closing below the previous low, a
@@ -115,12 +117,16 @@ and the live bot.
   structure has neutralised the opposing trend.
 - **Zone edges:** entry at the wick (single-candle base) or body (multi-candle
   base); stop beyond the base's wick extreme + 0.1 × ATR.
-- **Target:** 80% of the impulse, measured from the zone's origin (far edge) to
-  the impulse extreme. The limit order goes in once an H1 swing confirms that
-  extreme; a zone touched before then is used up.
-- **Playing field:** skip if the nearest active opposing zone (H1 or H4) is
-  closer than 2× the stop distance; skip if 5+ of the last 20 H1 candles have
-  wicks ≥ 1× ATR; skip within 30 min of high-impact news for either currency.
+- **Strong zones only:** the move-out impulse must be at least 2× the range of
+  the largest basing candle.
+- **Target (room):** long trades aim 80% of the way from the top of the demand
+  zone to the bottom of the next supply zone above; short trades aim 80% of the
+  way from the bottom of the supply zone to the top of the next demand zone
+  below (nearest active strong H1 or H4 zone). No opposing zone, no trade; too
+  little room fails the 2R minimum. The plan is fixed and the limit order goes
+  in as soon as the move-out candle closes.
+- **Playing field:** skip if 5+ of the last 20 H1 candles have wicks ≥ 1× ATR;
+  skip within 30 min of high-impact news for either currency.
   The news filter needs `data/news_events.csv` (`time,currency,impact`, UTC)
   and is off without it.
 - **Sizing:** the first entry risks ⅓ of the per-trade risk. Up to two more ⅓

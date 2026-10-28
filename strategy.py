@@ -3,23 +3,24 @@
 Timeframes: trend on D1, momentum on H4, zones and entries on H1.
 
 For a demand zone (supply is the mirror image):
-  1. Impulse: the move out of the zone is measured from its origin (the zone's
-     far edge) to the highest high it reaches. That high is only treated as the
-     extreme once an H1 swing high confirms it; the limit order goes in then.
-  2. Plan: entry at the zone's near edge, stop below the far edge minus
-     `atr_buffer` x ATR, target at `target_fraction` of the impulse from the origin.
+  1. Zones: strong zones only (move-out impulse >= 2x the basing candles, zones.py).
+  2. Plan, fixed when the zone forms (its move-out candle closes), and the limit
+     order goes in right away:
+     - entry at the top of the demand zone
+     - stop below the zone's far edge minus `atr_buffer` x ATR
+     - target `target_fraction` (80%) of the way from the entry to the bottom of
+       the next supply zone above (nearest active H1 or H4 strong zone). No
+       opposing zone, no trade.
   3. Filters, checked when price comes back to the zone:
      - reward:risk at least `min_reward_risk`
-     - direction: H4 momentum was up when the zone formed (the leg-out candle
-       closed), and the D1 trend is up when price returns; or, countertrend,
-       the D1 trend has been neutralised by a bullish D1 break of structure.
-       Momentum is checked at formation, not at the return, because price must
-       pull back against the trade to reach the zone, which turns momentum.
+     - direction: H4 momentum was up when the zone formed, and the D1 trend is
+       up when price returns; or, countertrend, the D1 trend has been
+       neutralised by a bullish D1 break of structure. Momentum is checked at
+       formation, not at the return, because price must pull back against the
+       trade to reach the zone, which turns momentum.
      - no high-impact news for either currency inside the news window
      - market not erratic: fewer than `max_big_wicks` of the last `wick_lookback`
        H1 candles have wicks of at least `wick_atr` x ATR
-     - room: the nearest active opposing (supply) zone above entry is at least
-       `min_room_rr` x stop distance away
   4. Sizing: first entry `initial_fraction` of the per-trade risk; up to `max_adds`
      more entries of `add_fraction` each, at market, after H1 breaks of structure
      in the trade's favour. Same stop and target for every entry; stops are not moved.
@@ -41,8 +42,6 @@ class StrategyConfig:
     atr_buffer: float = 0.1
     target_fraction: float = 0.8
     min_reward_risk: float = 2.0
-    min_room_rr: float = 2.0
-    impulse_swing_strength: int = 2
     wick_lookback: int = 20
     wick_atr: float = 1.0
     max_big_wicks: int = 5
@@ -55,26 +54,28 @@ class StrategyConfig:
     lol_tolerance_atr: float = 0.5
 
 
-def plan_trade(zone, extreme, cfg, pip):
-    """Entry, stop and target for a zone whose impulse reached `extreme`."""
+def plan_trade(zone, opposing_edge, cfg, pip):
+    """Entry, stop and target: target is `target_fraction` of the way from entry to the opposing zone."""
     buffer = cfg.atr_buffer * zone.atr_pips * pip
     if zone.kind == "demand":
-        origin = zone.bottom
-        return zone.top, zone.bottom - buffer, origin + cfg.target_fraction * (extreme - origin)
-    origin = zone.top
-    return zone.bottom, zone.top + buffer, origin - cfg.target_fraction * (origin - extreme)
+        entry = zone.top
+        return entry, zone.bottom - buffer, entry + cfg.target_fraction * (opposing_edge - entry)
+    entry = zone.bottom
+    return entry, zone.top + buffer, entry - cfg.target_fraction * (entry - opposing_edge)
 
 
-def impulse_extreme(kind, highs, lows, swing_high, swing_low, legout_idx, strength):
-    """(index of the candle whose close confirms the extreme, extreme price), or None if not yet confirmed."""
-    flags = swing_high if kind == "demand" else swing_low
-    hits = np.flatnonzero(flags[legout_idx:])
-    if not len(hits):
-        return None
-    j = legout_idx + hits[0]
-    if kind == "demand":
-        return j + strength, highs[legout_idx:j + 1].max()
-    return j + strength, lows[legout_idx:j + 1].min()
+def opposing_edge(long, entry, t, all_zones):
+    """Near edge of the nearest active opposing zone beyond the entry at time t, or None.
+
+    Long: the bottom of the lowest supply zone above the entry.
+    Short: the top of the highest demand zone below the entry.
+    """
+    opp = active_at(all_zones, t)
+    if long:
+        edges = opp.loc[(opp["kind"] == "supply") & (opp["bottom"] > entry), "bottom"]
+        return edges.min() if len(edges) else None
+    edges = opp.loc[(opp["kind"] == "demand") & (opp["top"] < entry), "top"]
+    return edges.max() if len(edges) else None
 
 
 def direction_check(long, d1_trend, d1_last_bos, h4_at_formation, cfg):
@@ -106,18 +107,6 @@ def zone_lifecycle(zones, candles, tf_delta):
 
 def active_at(zones, t):
     return zones[(zones["available_time"] <= t) & (zones["broken_time"] > t)]
-
-
-def room_to_opposing(long, entry, t, all_zones):
-    """Distance from entry to the nearest active opposing zone in the trade's path (inf if none)."""
-    opp = active_at(all_zones, t)
-    if long:
-        opp = opp[(opp["kind"] == "supply") & (opp["top"] > entry)]
-        gaps = (opp["bottom"] - entry).clip(lower=0)
-    else:
-        opp = opp[(opp["kind"] == "demand") & (opp["bottom"] < entry)]
-        gaps = (entry - opp["top"]).clip(lower=0)
-    return gaps.min() if len(gaps) else np.inf
 
 
 def big_wicks(candles, atr_values, cfg):

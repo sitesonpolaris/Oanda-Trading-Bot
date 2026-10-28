@@ -4,12 +4,11 @@ Each H1 zone gets a verdict with a reason, so the bot can log why it was or
 wasn't traded:
 
     touched           price already came back to the zone (not fresh)
-    waiting_impulse   the impulse extreme isn't confirmed by a swing yet
+    no_opposing_zone  no active opposing zone to aim for when the zone formed
     skipped_rr        target < min_reward_risk x stop distance
     skipped_trend     D1 trend now / H4 momentum at zone formation don't allow this direction
     skipped_news      high-impact news within the window
     skipped_erratic   too many big wicks recently
-    skipped_room      opposing zone too close
     signal            place a limit order
 
 Scale-ins: an open trade gets a market add signal after an H1 break of
@@ -21,9 +20,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from risk_manager import Signal
-from strategy import (big_wicks, direction_check, impulse_extreme, level_on_level, news_conflict, plan_trade,
-                      room_to_opposing)
-from structure import find_swings
+from strategy import big_wicks, direction_check, level_on_level, news_conflict, opposing_edge, plan_trade
 from zones import atr
 
 H1 = np.timedelta64(1, "h")
@@ -57,7 +54,6 @@ def evaluate_zones(zones, market, cfg, pip, now):
     """A ZoneVerdict per H1 zone as of `now` (market candles must all have closed by then)."""
     bars = market.bars
     h, l = bars["high"].to_numpy(), bars["low"].to_numpy()
-    swings = find_swings(bars, cfg.impulse_swing_strength)
     d1 = latest(market.d1, now)
     d1_trend, d1_bos = (d1["trend"], d1["last_bos"]) if d1 is not None else ("sideways", "")
     h1_bos = {"long": _last_bos_time(market.h1, "bullish", now), "short": _last_bos_time(market.h1, "bearish", now)}
@@ -76,19 +72,17 @@ def evaluate_zones(zones, market, cfg, pip, now):
             verdicts.append(ZoneVerdict(sid, z, "touched", f"{z.type}{tag}: price already returned to the zone",
                                         level_on_level=lol))
             continue
-        confirmed = impulse_extreme(z.kind, h, l, swings["swing_high"].to_numpy(), swings["swing_low"].to_numpy(),
-                                    legout, cfg.impulse_swing_strength)
-        if confirmed is None or confirmed[0] >= len(bars):
-            verdicts.append(ZoneVerdict(sid, z, "waiting_impulse", f"{z.type}{tag}: impulse extreme not confirmed yet",
+        edge = opposing_edge(long, near, z.legout_time + H1, market.all_zones)  # as of zone formation
+        if edge is None:
+            verdicts.append(ZoneVerdict(sid, z, "no_opposing_zone", f"{z.type}{tag}: no opposing zone to aim for",
                                         level_on_level=lol))
             continue
 
-        entry, stop, target = plan_trade(z, confirmed[1], cfg, pip)
+        entry, stop, target = plan_trade(z, edge, cfg, pip)
         risk, reward = abs(entry - stop), (target - entry) * (1 if long else -1)
         plan = f"{z.type}{tag} entry {entry:.5f} SL {stop:.5f} TP {target:.5f} RR {reward / risk:.2f}"
         h4 = latest(market.h4, z.legout_time + H1)  # momentum when the zone formed
         ok, why = direction_check(long, d1_trend, d1_bos, h4["trend"] if h4 is not None else "sideways", cfg)
-        room = room_to_opposing(long, entry, now, market.all_zones)
         if reward < cfg.min_reward_risk * risk:
             status, detail = "skipped_rr", f"{plan}: below {cfg.min_reward_risk}R"
         elif not ok:
@@ -97,8 +91,6 @@ def evaluate_zones(zones, market, cfg, pip, now):
             status, detail = "skipped_news", f"{plan}: {news['currency']} news at {news['time']:%Y-%m-%d %H:%M}"
         elif big_wicks >= cfg.max_big_wicks:
             status, detail = "skipped_erratic", f"{plan}: {big_wicks} big wicks in last {cfg.wick_lookback} candles"
-        elif room < cfg.min_room_rr * risk:
-            status, detail = "skipped_room", f"{plan}: opposing zone {room / risk:.1f}R away"
         else:
             side = "long" if long else "short"
             sig = Signal(market.instrument, side, entry, stop, target, sid, now, bos_time=h1_bos[side])

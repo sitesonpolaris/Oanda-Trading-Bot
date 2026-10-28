@@ -1,10 +1,10 @@
 """Backtest the strategy spec on the in-sample period only.
 
-Rules (see strategy.py): H1 zones, D1 trend + H4 momentum at zone formation, limit entry at the
-zone's near edge once the impulse extreme is confirmed, stop beyond the far edge
-+ ATR buffer, target at 80% of the impulse from its origin, playing-field filters
-(room to opposing zone, erratic wicks, news), a one-third first entry with up to
-two one-third adds on H1 breaks of structure in the trade's favour.
+Rules (see strategy.py): strong H1 zones, D1 trend + H4 momentum at zone
+formation, limit entry at the zone's near edge as soon as the zone forms, stop
+beyond the far edge + ATR buffer, target 80% of the way to the next opposing
+zone, erratic-wick and news filters, a one-third first entry with up to two
+one-third adds on H1 breaks of structure in the trade's favour.
 
 Execution is simulated on H1 mid candles with a fixed spread: buys fill and exit
 on the ask/bid side, so every entry, add and exit pays it. When one candle hits
@@ -33,9 +33,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from strategy import (StrategyConfig, big_wick_counts, direction_check, impulse_extreme, level_on_level,
-                      load_news, news_conflict, plan_trade, room_to_opposing, zone_lifecycle)
-from structure import StructureConfig, find_swings, market_structure
+from strategy import (StrategyConfig, big_wick_counts, direction_check, level_on_level, load_news, news_conflict,
+                      opposing_edge, plan_trade, zone_lifecycle)
+from structure import StructureConfig, market_structure
 from zones import ZoneConfig, atr, detect_zones, pip_size
 
 ROOT = Path(__file__).resolve().parent
@@ -129,8 +129,6 @@ def simulate(zones, market, cfg, pip):
     o, h, l, c = (bars[col].to_numpy() for col in ("open", "high", "low", "close"))
     bid = {"open": o - half, "high": h - half, "low": l - half, "close": c - half}
     ask = {"open": o + half, "high": h + half, "low": l + half, "close": c + half}
-    swings = find_swings(bars, cfg.impulse_swing_strength)
-    swing_high, swing_low = swings["swing_high"].to_numpy(), swings["swing_low"].to_numpy()
     atr_values = atr(bars).to_numpy()
     wicks = big_wick_counts(bars, atr_values, cfg)
     d1 = state_at_bars(bars, market.d1, ["trend", "last_bos"])
@@ -144,36 +142,33 @@ def simulate(zones, market, cfg, pip):
                "level_on_level": level_on_level(z, market.all_zones, z.atr_pips * pip, cfg),
                "zone_top": z.top, "zone_bottom": z.bottom, "status": "", "reason": ""}
         out.append(row)
-        legout = int(times.searchsorted(z.legout_time))
-        confirmed = impulse_extreme(z.kind, h, l, swing_high, swing_low, legout, cfg.impulse_swing_strength)
-        if confirmed is None or confirmed[0] + 1 >= len(bars):
-            row["status"] = "no_impulse_extreme"
+        order = int(times.searchsorted(z.legout_time)) + 1  # order goes in when the move-out candle closes
+        if order >= len(bars):
+            row["status"] = "untouched"
             continue
-        ready, extreme = confirmed
-        entry, stop, target = plan_trade(z, extreme, cfg, pip)
+        near = z.top if long else z.bottom
+        edge = opposing_edge(long, near, times.iat[order], market.all_zones)
+        if edge is None:
+            row["status"] = "no_opposing_zone"
+            continue
+        entry, stop, target = plan_trade(z, edge, cfg, pip)
         risk, reward = abs(entry - stop), (target - entry) * (1 if long else -1)
-        row.update(extreme=extreme, order_time=times.iat[ready + 1], entry=entry, stop=round(stop, 5),
-                   target=round(target, 5), risk_pips=round(risk / pip, 1), planned_rr=round(reward / risk, 2),
-                   spread_r=round(cfg.spread_pips * pip / risk, 3))
-
-        early = ask["low"][legout + 1:ready + 1] <= entry if long else bid["high"][legout + 1:ready + 1] >= entry
-        if early.any():
-            row["status"] = "touched_before_order"
-            continue
+        row.update(opposing_edge=edge, order_time=times.iat[order], entry=entry, stop=round(stop, 5),
+                   target=round(target, 5), risk_pips=round(risk / pip, 1), room_pips=round(abs(edge - entry) / pip, 1),
+                   planned_rr=round(reward / risk, 2), spread_r=round(cfg.spread_pips * pip / risk, 3))
         if reward < cfg.min_reward_risk * risk:
             row["status"], row["reason"] = "skipped_rr", f"{reward / risk:.2f}R"
             continue
-        touch = ask["low"][ready + 1:] <= entry if long else bid["high"][ready + 1:] >= entry
+        touch = ask["low"][order:] <= entry if long else bid["high"][order:] >= entry
         f = first_true(touch)
         if f is None:
             row["status"] = "untouched"
             continue
-        f += ready + 1
+        f += order
         t = times.iat[f]
         row["entry_time"] = t
 
-        formed = min(legout + 1, len(bars) - 1)  # first bar after the leg-out closed
-        ok, why = direction_check(long, d1["trend"][f], d1["last_bos"][f], h4["trend"][formed], cfg)
+        ok, why = direction_check(long, d1["trend"][f], d1["last_bos"][f], h4["trend"][order], cfg)
         row["reason"] = why
         if not ok:
             row["status"] = "skipped_trend"
@@ -183,11 +178,6 @@ def simulate(zones, market, cfg, pip):
             continue
         if wicks[f] >= cfg.max_big_wicks:
             row["status"], row["reason"] = "skipped_erratic", f"{int(wicks[f])} big wicks in {cfg.wick_lookback}"
-            continue
-        room = room_to_opposing(long, entry, t, market.all_zones)
-        row["room_r"] = round(room / risk, 2) if np.isfinite(room) else np.inf
-        if room < cfg.min_room_rr * risk:
-            row["status"] = "skipped_room"
             continue
 
         fill = min(entry, ask["open"][f]) if long else max(entry, bid["open"][f])
@@ -231,8 +221,8 @@ def summarize(trades, cfg):
         "max_drawdown_%": round(100 * drawdown.max(), 2),
         "avg_adds": round(filled["adds"].mean(), 2) if len(r) and "adds" in filled else 0.0,
         "zones": len(trades),
-        **{s: int(counts.get(s, 0)) for s in ("touched_before_order", "skipped_rr", "skipped_trend",
-                                              "skipped_news", "skipped_erratic", "skipped_room", "untouched")},
+        **{s: int(counts.get(s, 0)) for s in ("no_opposing_zone", "skipped_rr", "skipped_trend",
+                                              "skipped_news", "skipped_erratic", "untouched")},
     }
 
 

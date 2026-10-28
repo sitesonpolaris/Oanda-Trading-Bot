@@ -82,6 +82,15 @@ def test_direction_comes_from_the_break_not_the_candle_colour():
     assert z.kind == "demand" and z.type == "RBR"
 
 
+def test_move_out_must_be_twice_the_biggest_base_candle():
+    # BASE_A is 11 pips; a 20-pip impulse (1.8x) closing above it is not strong enough.
+    soft = (1.1002, 1.1021, 1.1001, 1.1020)
+    assert detect_zones(frame(history() + [RALLY_IN, BASE_A, soft])).empty
+    assert len(detect_zones(frame(history() + [RALLY_IN, BASE_A, soft]), ZoneConfig(min_impulse_vs_base=None))) == 1
+    strong = (1.1002, 1.1024, 1.1001, 1.1023)  # 23 pips: 2.1x
+    assert detect_zones(frame(history() + [RALLY_IN, BASE_A, strong])).iloc[0].impulse_vs_base == pytest.approx(2.09, abs=0.01)
+
+
 def test_basing_candle_cannot_be_the_impulse():
     drift = (1.1004, 1.1009, 1.1001, 1.1007)  # small doji-ish candle closing just above BASE_A's high
     assert detect_zones(frame(history() + [RALLY_IN, BASE_A, drift])).empty

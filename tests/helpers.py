@@ -1,9 +1,9 @@
 """Hand-built H1 market for strategy, backtest and signal tests.
 
-Demand zone 1.0990-1.1000 (ATR 10 pips), leg-out at bar 2. Bar 3 makes the impulse
-high (1.1050), confirmed as a swing at the close of bar 5, so the order goes in at
-bar 6. Plan: entry 1.1000, stop 1.0989, target 1.0990 + 0.8 x 60 pips = 1.1038
-(3.45R). Bar 7 touches the zone, bar 8 reaches the target.
+Demand zone 1.0990-1.1000 (ATR 10 pips), leg-out at bar 2, so the limit order goes
+in at bar 3. The default opposing supply zone starts at 1.1050, so the plan is:
+entry 1.1000, stop 1.0989, target 1.1000 + 0.8 x 50 pips = 1.1040 (3.64R).
+Bars 3-6 stay above the zone, bar 7 touches it, bar 8 reaches the target.
 """
 
 import pandas as pd
@@ -41,7 +41,10 @@ def lifecycle_zone(kind, top, bottom, available=T0 - pd.Timedelta(hours=1), brok
             "bottom": bottom, "available_time": available, "broken_time": broken}
 
 
-def market(b, d1_trend="up", d1_bos="", h4_trend="up", h1_bos=None, zones=(), news=None):
+SUPPLY_ABOVE = lifecycle_zone("supply", top=1.1060, bottom=1.1050)  # default opposing zone for demand trades
+
+
+def market(b, d1_trend="up", d1_bos="", h4_trend="up", h1_bos=None, zones=None, news=None):
     state = pd.DataFrame({"available_time": [T0 - pd.Timedelta(days=1)]})
     return Market(
         bars=b,
@@ -49,8 +52,9 @@ def market(b, d1_trend="up", d1_bos="", h4_trend="up", h1_bos=None, zones=(), ne
         h4=state.assign(trend=h4_trend, last_bos="", last_swing_high=1.11, last_swing_low=1.09, bos=""),
         h1=pd.DataFrame({"available_time": b["time"] + pd.Timedelta(hours=1),
                          "bos": h1_bos or [""] * len(b)}),
-        all_zones=pd.DataFrame(list(zones), columns=["start_time", "kind", "top", "bottom", "available_time",
-                                                     "broken_time"]),
+        all_zones=pd.DataFrame(list(zones if zones is not None else [SUPPLY_ABOVE]),
+                               columns=["start_time", "kind", "top", "bottom", "available_time", "broken_time"]),
         news=news,
         instrument="EUR_USD",
     )
+

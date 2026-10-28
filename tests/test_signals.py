@@ -4,7 +4,7 @@ import pandas as pd
 
 from backtest import BacktestConfig
 from executioner import OpenTrade
-from helpers import SETUP, T0, TOUCH, bars, market, zone
+from helpers import SETUP, SUPPLY_ABOVE, T0, TOUCH, bars, market, zone
 from signals import add_signals, evaluate_zones
 
 PIP = 0.0001
@@ -23,13 +23,13 @@ def verdict(rows, **kw):
 def test_fresh_confirmed_trend_aligned_zone_is_a_signal():
     v = verdict(SETUP)
     assert v.status == "signal" and v.signal.order_type == "LIMIT"
-    assert (v.signal.entry, round(v.signal.target, 5)) == (1.1000, 1.1038)
+    assert (v.signal.entry, round(v.signal.target, 5)) == (1.1000, 1.1040)
     assert v.setup_id == "EUR_USD-H1-202601050900"
 
 
 def test_touched_and_unconfirmed_and_trend_verdicts():
     assert verdict(SETUP + [TOUCH]).status == "touched"
-    assert verdict(SETUP[:4]).status == "waiting_impulse"  # swing high not confirmed yet
+    assert verdict(SETUP, zones=[]).status == "no_opposing_zone"
     assert verdict(SETUP, h4_trend="down").status == "skipped_trend"
 
 
@@ -38,7 +38,7 @@ def test_level_on_level_signals_come_first():
     stacked = {"start_time": T0 - pd.Timedelta(hours=5), "kind": "demand", "top": 1.0992, "bottom": 1.0985,
                "available_time": T0 - pd.Timedelta(hours=3), "broken_time": pd.Timestamp.max.tz_localize("UTC")}
     zones = pd.DataFrame([zone(top=1.1000, bottom=1.0990), zone(top=1.0960, bottom=1.0950, start=T0)])
-    v = evaluate_zones(zones, market(b, zones=[stacked]), CFG, PIP, now_after(b))
+    v = evaluate_zones(zones, market(b, zones=[stacked, SUPPLY_ABOVE]), CFG, PIP, now_after(b))
     assert v[0].level_on_level and v[0].zone.top == 1.1000
 
 

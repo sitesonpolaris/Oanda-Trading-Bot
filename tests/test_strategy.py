@@ -1,12 +1,11 @@
 from types import SimpleNamespace
 
-import numpy as np
 import pandas as pd
 import pytest
 
 from helpers import T0, bars, lifecycle_zone
-from strategy import (StrategyConfig, direction_check, impulse_extreme, level_on_level, news_conflict, plan_trade,
-                      room_to_opposing, zone_lifecycle)
+from strategy import (StrategyConfig, direction_check, level_on_level, news_conflict, opposing_edge, plan_trade,
+                      zone_lifecycle)
 
 CFG = StrategyConfig()
 
@@ -16,19 +15,11 @@ def z(kind, top, bottom, **kw):
                            legout_time=T0 + pd.Timedelta(hours=1), **kw)
 
 
-def test_target_is_80pct_of_impulse_from_origin():
+def test_target_is_80pct_of_the_way_to_the_opposing_zone():
     entry, stop, target = plan_trade(z("demand", 1.1000, 1.0990), 1.1050, CFG, 0.0001)
-    assert (entry, stop, target) == (1.1000, pytest.approx(1.0989), pytest.approx(1.1038))
+    assert (entry, stop, target) == (1.1000, pytest.approx(1.0989), pytest.approx(1.1040))
     entry, stop, target = plan_trade(z("supply", 1.1010, 1.1000), 1.0950, CFG, 0.0001)
-    assert (entry, stop, target) == (1.1000, pytest.approx(1.1011), pytest.approx(1.1010 - 0.8 * 0.0060))
-
-
-def test_impulse_extreme_waits_for_swing_confirmation():
-    highs = np.array([1.0, 1.0, 1.2, 1.5, 1.4, 1.3, 1.6])
-    lows = highs - 0.1
-    swing_high = np.array([False, False, False, True, False, False, False])
-    assert impulse_extreme("demand", highs, lows, swing_high, ~swing_high & False, 2, 2) == (5, 1.5)
-    assert impulse_extreme("demand", highs, lows, np.zeros(7, bool), np.zeros(7, bool), 2, 2) is None
+    assert (entry, stop, target) == (1.1000, pytest.approx(1.1011), pytest.approx(1.0960))
 
 
 @pytest.mark.parametrize("long,d1,bos,h4,ok", [
@@ -52,13 +43,14 @@ def test_zone_lifecycle_breaks_on_close_beyond_far_edge():
     assert out["broken_time"].iat[0] == T0 + pd.Timedelta(hours=2)  # bar 1 closed below 1.0990
 
 
-def test_room_uses_nearest_active_opposing_zone():
+def test_opposing_edge_is_nearest_active_zone_beyond_entry():
     zones = pd.DataFrame([lifecycle_zone("supply", 1.1040, 1.1030), lifecycle_zone("supply", 1.1025, 1.1020),
                           lifecycle_zone("supply", 1.1015, 1.1012, broken=T0 - pd.Timedelta(minutes=1)),
-                          lifecycle_zone("demand", 1.1010, 1.1005)])
-    assert room_to_opposing(True, 1.1000, T0, zones) == pytest.approx(0.0020)
-    assert room_to_opposing(True, 1.1050, T0, zones) == np.inf
-    assert room_to_opposing(False, 1.1030, T0, zones) == pytest.approx(0.0020)
+                          lifecycle_zone("demand", 1.1010, 1.1005), lifecycle_zone("demand", 1.0990, 1.0980)])
+    assert opposing_edge(True, 1.1000, T0, zones) == 1.1020      # bottom of the nearest supply above
+    assert opposing_edge(True, 1.1050, T0, zones) is None
+    assert opposing_edge(False, 1.1000, T0, zones) == 1.0990     # top of the nearest demand below
+    assert opposing_edge(False, 1.0970, T0, zones) is None
 
 
 def test_level_on_level_needs_stacked_same_side_zone():

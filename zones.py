@@ -9,8 +9,11 @@ An impulse candle is a non-basing candle that closes outside the range of the
 candle before it: above its high is a rally (R), below its low a drop (D). The
 leg-in is the impulse right before the base; the leg-out is the impulse right
 after it. The leg-out's direction makes it a demand (R) or supply (D) zone.
-Optionally the leg-out must also be at least `legout_multiple` times the average
-range of the candles before it. Zone types:
+
+Only strong zones are kept: the leg-out's range must be at least
+`min_impulse_vs_base` (2x) the range of the largest basing candle. Optionally it
+must also be `legout_multiple` times the average range of the candles before it.
+Zone types:
 
     RBR  rally-base-rally  (demand)     DBR  drop-base-rally  (demand)
     DBD  drop-base-drop    (supply)     RBD  rally-base-drop  (supply)
@@ -27,12 +30,15 @@ import pandas as pd
 
 ZONE_COLUMNS = [
     "start_time", "legout_time", "type", "kind", "top", "bottom", "base_candles",
-    "impulse_pips", "impulse_ratio", "impulse_atr", "atr_pips",
+    "impulse_pips", "impulse_ratio", "impulse_vs_base", "impulse_atr", "atr_pips",
 ]
 
 
 @dataclass
 class ZoneConfig:
+    # Strong move-out: leg-out range >= min_impulse_vs_base x the largest basing candle's range.
+    # None = off.
+    min_impulse_vs_base: float | None = 2.0
     # Optional strength filter on the impulse: range >= legout_multiple x mean range of the
     # previous legout_lookback candles. None = off (any close outside the previous range counts).
     legout_multiple: float | None = None
@@ -101,6 +107,9 @@ def detect_zones(df, config=None, pip=0.0001):
             continue  # the candle before the base isn't a move-in impulse
 
         base = slice(i - n, i)
+        biggest_base = rng[base].max()
+        if cfg.min_impulse_vs_base is not None and rng[i] < cfg.min_impulse_vs_base * biggest_base:
+            continue  # move-out not strong enough
         # Far edge (stop side) is always the base's wick extreme; the near (entry) edge is the
         # wick for a single-candle base and the body for a multi-candle base.
         top, bottom = h[base].max(), l[base].min()
@@ -118,6 +127,7 @@ def detect_zones(df, config=None, pip=0.0001):
             "base_candles": n,
             "impulse_pips": round(rng[i] / pip, 1),
             "impulse_ratio": round(rng[i] / avg_prev_range[i], 2),
+            "impulse_vs_base": round(rng[i] / biggest_base, 2) if biggest_base > 0 else float("inf"),
             "impulse_atr": round(rng[i] / atr_vals[i - 1], 2),
             "atr_pips": round(atr_vals[i - 1] / pip, 1),
         })
