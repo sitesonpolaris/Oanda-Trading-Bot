@@ -1,3 +1,4 @@
 oandapyV20>=0.7.2
 requests>=2.25
 pandas>=2.0
+matplotlib>=3.7
