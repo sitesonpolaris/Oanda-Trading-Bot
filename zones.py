@@ -2,12 +2,15 @@
 
 Pure analysis: reads OHLC dataframes, returns zones. No API access, no orders.
 
-A zone is a base of 1-5 basing candles followed by an impulse candle (the
-leg-out): the first non-basing candle that closes outside the previous candle's
-range. A close above the previous high is a bullish impulse (demand zone), a
-close below the previous low a bearish one (supply zone). Optionally the impulse
-must also be at least `legout_multiple` times the average range of the candles
-before it. The candle before the base is the leg-in. Zone types:
+A zone is three parts: a move-in impulse candle (leg-in), 1-5 basing candles,
+and a move-out impulse candle (leg-out).
+
+An impulse candle is a non-basing candle that closes outside the range of the
+candle before it: above its high is a rally (R), below its low a drop (D). The
+leg-in is the impulse right before the base; the leg-out is the impulse right
+after it. The leg-out's direction makes it a demand (R) or supply (D) zone.
+Optionally the leg-out must also be at least `legout_multiple` times the average
+range of the candles before it. Zone types:
 
     RBR  rally-base-rally  (demand)     DBR  drop-base-rally  (demand)
     DBD  drop-base-drop    (supply)     RBD  rally-base-drop  (supply)
@@ -90,9 +93,14 @@ def detect_zones(df, config=None, pip=0.0001):
         leg_in = i - n - 1
         if n < cfg.min_base_candles or small[leg_in]:
             continue  # no base, or the consolidation runs longer than max_base_candles
+        if c[leg_in] > h[leg_in - 1]:
+            leg_in_dir = "R"
+        elif c[leg_in] < l[leg_in - 1]:
+            leg_in_dir = "D"
+        else:
+            continue  # the candle before the base isn't a move-in impulse
 
         base = slice(i - n, i)
-        leg_in_dir = "R" if c[leg_in] > o[leg_in] else "D"
         # Far edge (stop side) is always the base's wick extreme; the near (entry) edge is the
         # wick for a single-candle base and the body for a multi-candle base.
         top, bottom = h[base].max(), l[base].min()

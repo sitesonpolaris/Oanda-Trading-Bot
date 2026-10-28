@@ -71,8 +71,10 @@ How a zone is found (`zones.py`):
    supply zone. A run of more than 5 basing candles is consolidation, not a base.
    An optional strength filter (`legout_multiple`, off by default) also requires
    the impulse to be N× the average range of the previous 10 candles.
-4. The candle before the base is the **leg-in**. Leg-in and leg-out direction
-   give the type: RBR / DBR (demand), DBD / RBD (supply).
+4. The candle before the base must be a **move-in impulse** too (a non-basing
+   candle closing outside the range of the candle before it). The direction of
+   each impulse's break, not its colour, gives the type: RBR / DBR (demand),
+   DBD / RBD (supply).
 5. Edges: the far (stop) edge is the base's wick extreme; the entry edge is the
    wick for a single-candle base and the body for a multi-candle base.
 

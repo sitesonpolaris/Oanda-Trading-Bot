@@ -16,8 +16,8 @@ def history(n=20):
 
 
 # Leg-in / base / leg-out building blocks around price ~1.1000.
-RALLY_IN = (1.0990, 1.1012, 1.0988, 1.1010)
-DROP_IN = (1.1010, 1.1012, 1.0988, 1.0990)
+RALLY_IN = (1.0990, 1.1014, 1.0988, 1.1012)  # closes above the previous high (1.1010): move-in rally
+DROP_IN = (1.1010, 1.1012, 1.0986, 1.0988)   # closes below the previous low (1.0990): move-in drop
 BASE_A = (1.1000, 1.1006, 1.0995, 1.1002)  # body 1.1000-1.1002, wick 1.0995-1.1006
 BASE_B = (1.1003, 1.1008, 1.0997, 1.1001)  # body 1.1001-1.1003, wick 1.0997-1.1008
 RALLY_OUT = (1.1002, 1.1062, 1.1000, 1.1060)  # 62-pip range, strong body
@@ -96,6 +96,17 @@ def test_base_longer_than_max_is_rejected():
     df = frame(history() + [RALLY_IN] + [BASE_A, BASE_B] * 3 + [RALLY_OUT])
     assert detect_zones(df).empty
     assert detect_zones(df, ZoneConfig(max_base_candles=6)).iloc[0].base_candles == 6
+
+
+def test_leg_in_must_be_an_impulse():
+    no_break = (1.0992, 1.1009, 1.0991, 1.1008)  # strong body but closes inside FLAT's range
+    assert detect_zones(frame(history() + [no_break, BASE_A, RALLY_OUT])).empty
+
+
+def test_leg_in_direction_comes_from_the_break_not_the_candle_colour():
+    green_drop = (1.0975, 1.0995, 1.0970, 1.0985)  # green, but closes below FLAT's low: a drop in
+    z = detect_zones(frame(history() + [green_drop, BASE_A, RALLY_OUT])).iloc[0]
+    assert z.type == "DBR"
 
 
 def test_no_base_means_no_zone():
