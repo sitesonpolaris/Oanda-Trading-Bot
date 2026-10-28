@@ -2,13 +2,15 @@
 zone stacked on it in the same move.
 
 Long (short is the mirror image):
-  1. Downtrend: the last two H1 swing highs and lows are lower highs and lower lows.
-  2. Reversal: a DBR demand zone whose rally closes above the most recent lower
-     high (break of structure, a higher high).
-  3. Level on level: in that same rally, after the break of structure, the rally
-     pauses and leaves an RBR demand zone (the first one). "Same rally" means the
-     RBR's base starts before the rally's first H1 swing high, i.e. before any
-     real pullback.
+  1. Downtrend: when the DBR's rally starts, the last two H1 swing highs and lows
+     are lower highs and lower lows.
+  2. Reversal: a DBR demand zone. It doesn't need the 2x move-out (the break of
+     structure is the strength test). Its rally closes above the most recent
+     lower high (break of structure) before price comes back to the zone.
+  3. Level on level (drop-base-rally-base-rally): the first RBR demand zone that
+     completes after the break of structure. The DBR's rally candle can be the
+     RBR's move-in. "Same rally": until the RBR's base starts, no candle closes
+     back below the broken lower high (the pause can chop sideways above it).
   4. Entry: limit order at the top of the RBR once the RBR is valid (2x move away).
   5. Stop: bottom of the RBR minus `atr_buffer` x the daily ATR.
   6. Trend: not required. The break of structure and the stacked zone are the
@@ -34,7 +36,7 @@ import pandas as pd
 from backtest import (HOLDOUT_FROM, OUT_DIR, SPREAD_PIPS, build_market, exit_after_fill, first_true, load,
                       state_at_bars)
 from strategy import active_at
-from structure import StructureConfig, find_swings, market_structure
+from structure import StructureConfig, market_structure
 from zones import ZoneConfig, detect_zones, pip_size
 
 SWINGS_ONLY = StructureConfig(stage_mas=None, bos_invalidates_trend=False)
@@ -47,6 +49,8 @@ class LoLConfig:
     min_reward_risk: float = 2.0
     spread_pips: float = 1.2
     zones: ZoneConfig = field(default_factory=ZoneConfig)
+    # The reversal zone doesn't need the move-out to be 2x the base.
+    reversal_impulse_vs_base: float | None = None
 
 
 def find_setups(h1, cfg=None, pip=0.0001):
@@ -54,34 +58,40 @@ def find_setups(h1, cfg=None, pip=0.0001):
     cfg = cfg or LoLConfig()
     h1 = h1.reset_index(drop=True)
     times = h1["time"]
-    swings = find_swings(h1, SWINGS_ONLY.swing_strength)
-    tops = {"long": np.flatnonzero(swings["swing_high"].to_numpy()), "short": np.flatnonzero(swings["swing_low"].to_numpy())}
-    reversals = detect_zones(h1, cfg.zones, pip=pip)  # breakout = break of the prior swing
-    continuations = detect_zones(h1, ZoneConfig(**{**cfg.zones.__dict__, "require_breakout": False}), pip=pip)
-    trend = market_structure(h1, SWINGS_ONLY)["trend"].to_numpy()
+    no_breakout = {**cfg.zones.__dict__, "require_breakout": False}
+    reversals = detect_zones(h1, ZoneConfig(**{**no_breakout, "min_impulse_vs_base": cfg.reversal_impulse_vs_base}), pip=pip)
+    continuations = detect_zones(h1, ZoneConfig(**no_breakout), pip=pip)
+    ms = market_structure(h1, SWINGS_ONLY)
+    trend, bos_dir = ms["trend"].to_numpy(), ms["bos"].to_numpy()
+    lo, hi, c = h1["low"].to_numpy(), h1["high"].to_numpy(), h1["close"].to_numpy()
     rows = []
     for rev in reversals[reversals["type"].isin(["DBR", "RBD"])].itertuples(index=False):
-        if pd.isna(rev.breakout_time):
-            continue
         demand = rev.kind == "demand"
-        base_start = int(times.searchsorted(rev.start_time))
-        legout, bos = int(times.searchsorted(rev.legout_time)), int(times.searchsorted(rev.breakout_time))
-        if trend[base_start - 1] != ("down" if demand else "up"):
-            continue  # no lower highs and lower lows (or higher highs and lows) before the reversal
-        later = tops["long" if demand else "short"]
-        later = later[later > legout]
-        first_top = later[0] if len(later) else len(h1)  # the rally's first swing high (drop's first swing low)
+        legout = int(times.searchsorted(rev.legout_time))
+        if trend[legout - 1] != ("down" if demand else "up"):
+            continue  # no lower highs and lower lows (or higher highs and lows) for the rally to reverse
+        breaks = np.flatnonzero(bos_dir[legout:] == ("bullish" if demand else "bearish"))
+        if not len(breaks):
+            continue
+        bos = legout + breaks[0]
+        back = lo[legout + 1:bos + 1] <= rev.top if demand else hi[legout + 1:bos + 1] >= rev.bottom
+        if back.any():
+            continue  # price came back to the reversal zone before breaking structure
+        level = ms["last_swing_high" if demand else "last_swing_low"].iat[bos - 1]  # the level the BOS broke
         for cont in continuations[continuations["type"] == ("RBR" if demand else "DBD")].itertuples(index=False):
             move_in = int(times.searchsorted(cont.start_time)) - 1
-            if move_in < bos or move_in < legout:
-                continue  # the continuation must come after the break of structure
-            if move_in + 1 > first_top:
-                break  # the rally topped out before this pause: not the same move
+            cont_out = int(times.searchsorted(cont.legout_time))
+            if move_in < legout or cont_out <= bos:
+                continue  # the continuation must complete after the break of structure
+            pause = slice(bos + 1, move_in + 1)
+            failed = (c[pause] < level) if demand else (c[pause] > level)
+            if failed.any():
+                break  # the broken level gave way before this pause: not the same rally
             rows.append({
                 "side": "long" if demand else "short",
                 "rev_type": rev.type, "rev_start": rev.start_time, "rev_legout": rev.legout_time,
                 "rev_top": rev.top, "rev_bottom": rev.bottom,
-                "bos_time": rev.breakout_time, "bos_level": rev.breakout_level,
+                "bos_time": times.iat[bos], "bos_level": level,
                 "cont_type": cont.type, "cont_start": cont.start_time, "cont_legout": cont.legout_time,
                 "cont_top": cont.top, "cont_bottom": cont.bottom, "cont_valid": cont.valid_time,
             })

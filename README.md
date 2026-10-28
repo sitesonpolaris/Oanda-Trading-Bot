@@ -64,12 +64,13 @@ python detect_zones.py
 How a zone is found (`zones.py`), following the TWP course "Supply and Demand –
 Steps to Drawing Zones":
 
-1. **Basing candle:** body ≤ 50% of its range. 1–5 of them form the base; more
-   than 5 disqualifies the zone.
-2. **Move-in and move-out candles:** a rally candle closes in the top 25% of
-   its range and above the previous candle's high (a drop candle is the mirror
-   image); colour isn't checked. The move-out must also be at least 2× the
-   biggest basing candle and taller than the move-in.
+1. **Basing candle:** body ≤ 50% of its range, or a close inside the previous
+   candle's range. 1–5 of them form the base; more than 5 disqualifies the zone.
+2. **Move-in and move-out candles:** a rally candle closes above the previous
+   candle's high (a drop candle closes below its low); colour isn't checked.
+   The move-out must also be at least 2× the biggest basing candle and taller
+   than the move-in. (The course's "close in the top 25%" check is available as
+   `close_zone=0.25`, off by default.)
 3. **Breakout:** the impulse must close beyond the most recent swing high
    (demand) or swing low (supply) that existed before the base.
 4. **Move away:** price must travel at least 2× the zone's height away from it.

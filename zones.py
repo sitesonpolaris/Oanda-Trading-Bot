@@ -5,11 +5,12 @@ Pure analysis: reads OHLC dataframes, returns zones. No API access, no orders.
 
 A zone is a move-in candle, 1-5 basing candles, and a move-out candle:
 
-  - Basing candle: body <= 50% of its range (wick to wick).
-  - Rally candle (move-in or move-out): closes in the top 25% of its range and
-    above the previous candle's high. Colour isn't checked ("candles do not have
-    to be green"); in practice a non-basing candle closing in its top quarter is
-    always green. A drop candle is the mirror image. Neither can be a basing candle.
+  - Basing candle: body <= 50% of its range (wick to wick), or a close inside
+    the previous candle's range.
+  - Rally candle (move-in or move-out): any other candle that closes above the
+    previous candle's high. A drop candle closes below the previous candle's low.
+    (The course's optional "close in the top 25% of the range" check is
+    `close_zone`, off by default.)
   - Move-out: also at least 2x the range of the biggest basing candle and taller
     than the move-in candle.
   - More than 5 basing candles disqualifies the zone.
@@ -50,12 +51,15 @@ ZONE_COLUMNS = [
 
 @dataclass
 class ZoneConfig:
-    # Basing candle: body <= base_max_body_ratio of its range.
+    # Basing candle: body <= base_max_body_ratio of its range, or (if inside_close_is_base) a close
+    # inside the previous candle's range.
     base_max_body_ratio: float = 0.5
+    inside_close_is_base: bool = True
     min_base_candles: int = 1
     max_base_candles: int = 5
-    # Move-in / move-out candles close in the top (rally) or bottom (drop) close_zone of their range.
-    close_zone: float = 0.25
+    # Move-in / move-out candles close in the top (rally) or bottom (drop) close_zone of their range
+    # (None = off: closing beyond the previous candle is enough).
+    close_zone: float | None = None
     # Move-out range >= min_impulse_vs_base x the biggest basing candle (None = off), and (if
     # move_out_taller_than_move_in) taller than the move-in candle.
     min_impulse_vs_base: float | None = 2.0
@@ -92,9 +96,10 @@ def candle_direction(h, l, c, i, close_zone):
     rng = h[i] - l[i]
     if rng <= 0 or i == 0:
         return ""
-    if c[i] >= h[i] - close_zone * rng and c[i] > h[i - 1]:
+    zone = rng if close_zone is None else close_zone * rng
+    if c[i] >= h[i] - zone and c[i] > h[i - 1]:
         return "R"
-    if c[i] <= l[i] + close_zone * rng and c[i] < l[i - 1]:
+    if c[i] <= l[i] + zone and c[i] < l[i - 1]:
         return "D"
     return ""
 
@@ -121,6 +126,9 @@ def detect_zones(df, config=None, pip=0.0001):
     rng = h - l
     body_ratio = np.divide(abs(c - o), rng, out=np.zeros_like(rng), where=rng > 0)
     basing = body_ratio <= cfg.base_max_body_ratio
+    if cfg.inside_close_is_base:
+        prev_h, prev_l = np.roll(h, 1), np.roll(l, 1)
+        basing |= (c <= prev_h) & (c >= prev_l) & (np.arange(len(df)) > 0)
     atr_vals = atr(df, cfg.atr_period).to_numpy()
     avg_prev_range = pd.Series(rng).rolling(cfg.legout_lookback).mean().shift().to_numpy()
     swings = find_swings(df, cfg.swing_strength)

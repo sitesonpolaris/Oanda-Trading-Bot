@@ -64,11 +64,19 @@ def test_multi_candle_base_body_to_wick():
     assert z.base_candles == 2 and z.start_time == frame(df)["time"].iloc[-3]
 
 
-def test_rally_candle_must_close_in_top_quarter():
-    weak_close = (1.1002, 1.1062, 1.1000, 1.1040)  # closes 35% below its high
-    assert zones(history() + [RALLY_IN, BASE_A, weak_close]).empty
-    loose = ZoneConfig(require_breakout=False, close_zone=0.4)
-    assert len(zones(history() + [RALLY_IN, BASE_A, weak_close], loose)) == 1
+def test_rally_candle_only_needs_to_close_above_previous_high():
+    weak_close = (1.1002, 1.1062, 1.1000, 1.1040)  # closes 35% below its high, but above the base
+    assert len(zones(history() + [RALLY_IN, BASE_A, weak_close])) == 1
+    top_quarter = ZoneConfig(require_breakout=False, close_zone=0.25)  # the course's optional check
+    assert zones(history() + [RALLY_IN, BASE_A, weak_close], top_quarter).empty
+
+
+def test_big_body_closing_inside_previous_range_is_a_basing_candle():
+    inside = (1.0996, 1.1013, 1.0995, 1.1010)  # 82% body, but closes below the move-in's high (1.1014)
+    z = zones(history() + [RALLY_IN, inside, RALLY_OUT]).iloc[0]
+    assert z.base_candles == 1 and (z.top, z.bottom) == (1.1013, 1.0995)
+    strict = ZoneConfig(require_breakout=False, inside_close_is_base=False)
+    assert zones(history() + [RALLY_IN, inside, RALLY_OUT], strict).empty
 
 
 def test_red_candle_closing_near_its_high_is_a_basing_candle_not_a_rally():
