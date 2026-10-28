@@ -58,17 +58,44 @@ def test_impulse_size_reported_in_pips_and_multiples():
     assert z.impulse_ratio >= 2.5
 
 
-def test_leg_out_below_multiple_is_ignored():
+def test_any_close_outside_previous_range_is_an_impulse_by_default():
     weak = (1.1002, 1.1040, 1.1000, 1.1038)  # 40 pips, only ~2x the 20-pip average
-    assert detect_zones(frame(history() + [RALLY_IN, BASE_A, weak])).empty
-    assert len(detect_zones(frame(history() + [RALLY_IN, BASE_A, weak]),
-                            ZoneConfig(legout_multiple=1.5))) == 1
+    assert len(detect_zones(frame(history() + [RALLY_IN, BASE_A, weak]))) == 1
+
+
+def test_optional_strength_multiple():
+    weak = (1.1002, 1.1040, 1.1000, 1.1038)
+    assert detect_zones(frame(history() + [RALLY_IN, BASE_A, weak]), ZoneConfig(legout_multiple=2.5)).empty
+    assert len(detect_zones(frame(history() + [RALLY_IN, BASE_A, weak]), ZoneConfig(legout_multiple=1.5))) == 1
+
+
+def test_close_inside_previous_range_is_not_an_impulse():
+    # Big candle, strong body, but closes 1 pip below the base candle's high (1.1006).
+    inside = (1.0995, 1.1050, 1.0994, 1.1005)
+    assert detect_zones(frame(history() + [RALLY_IN, BASE_A, inside])).empty
+
+
+def test_direction_comes_from_the_break_not_the_candle_colour():
+    # Gaps up, closes red but still above the base high: bullish impulse.
+    red_break = (1.1060, 1.1065, 1.1020, 1.1025)
+    z = detect_zones(frame(history() + [RALLY_IN, BASE_A, red_break])).iloc[0]
+    assert z.kind == "demand" and z.type == "RBR"
+
+
+def test_basing_candle_cannot_be_the_impulse():
+    drift = (1.1004, 1.1009, 1.1001, 1.1007)  # small doji-ish candle closing just above BASE_A's high
+    assert detect_zones(frame(history() + [RALLY_IN, BASE_A, drift])).empty
+
+
+def test_base_of_up_to_five_candles():
+    df = frame(history() + [RALLY_IN] + [BASE_A, BASE_B, BASE_A, BASE_B, BASE_A] + [RALLY_OUT])
+    assert detect_zones(df).iloc[0].base_candles == 5
 
 
 def test_base_longer_than_max_is_rejected():
-    df = frame(history() + [RALLY_IN] + [BASE_A, BASE_B] * 2 + [RALLY_OUT])
+    df = frame(history() + [RALLY_IN] + [BASE_A, BASE_B] * 3 + [RALLY_OUT])
     assert detect_zones(df).empty
-    assert detect_zones(df, ZoneConfig(max_base_candles=4)).iloc[0].base_candles == 4
+    assert detect_zones(df, ZoneConfig(max_base_candles=6)).iloc[0].base_candles == 6
 
 
 def test_no_base_means_no_zone():

@@ -2,9 +2,12 @@
 
 Pure analysis: reads OHLC dataframes, returns zones. No API access, no orders.
 
-A zone is a base of 1-3 small candles followed by a leg-out candle whose range
-is at least `legout_multiple` times the average range of the candles before it.
-The candle before the base is the leg-in. Zone types:
+A zone is a base of 1-5 basing candles followed by an impulse candle (the
+leg-out): the first non-basing candle that closes outside the previous candle's
+range. A close above the previous high is a bullish impulse (demand zone), a
+close below the previous low a bearish one (supply zone). Optionally the impulse
+must also be at least `legout_multiple` times the average range of the candles
+before it. The candle before the base is the leg-in. Zone types:
 
     RBR  rally-base-rally  (demand)     DBR  drop-base-rally  (demand)
     DBD  drop-base-drop    (supply)     RBD  rally-base-drop  (supply)
@@ -27,14 +30,13 @@ ZONE_COLUMNS = [
 
 @dataclass
 class ZoneConfig:
-    # Leg-out: range >= legout_multiple x mean range of the previous legout_lookback candles.
-    legout_multiple: float = 2.5
+    # Optional strength filter on the impulse: range >= legout_multiple x mean range of the
+    # previous legout_lookback candles. None = off (any close outside the previous range counts).
+    legout_multiple: float | None = None
     legout_lookback: int = 10
-    # Leg-out must be a decisive candle: body at least this fraction of its range.
-    legout_min_body_ratio: float = 0.5
-    # Base length. A run of small candles longer than max_base_candles is not a base.
+    # Base length. A run of basing candles longer than max_base_candles is not a base.
     min_base_candles: int = 1
-    max_base_candles: int = 3
+    max_base_candles: int = 5
     # "Small" base candle: body <= base_max_body_ratio of its range and range <= base_max_atr x ATR.
     base_max_body_ratio: float = 0.5
     base_max_atr: float = 1.0
@@ -57,7 +59,7 @@ def atr(df, period=14):
 
 
 def detect_zones(df, config=None, pip=0.0001):
-    """Return a dataframe of zones (one per qualifying leg-out), oldest first."""
+    """Return a dataframe of zones (one per impulse candle), oldest first."""
     cfg = config or ZoneConfig()
     df = df.reset_index(drop=True)
     o, h, l, c = (df[col].to_numpy() for col in ("open", "high", "low", "close"))
@@ -71,8 +73,15 @@ def detect_zones(df, config=None, pip=0.0001):
     zones = []
     first = max(cfg.legout_lookback, cfg.atr_period) + cfg.max_base_candles + 1
     for i in range(first, len(df)):
-        if not (rng[i] >= cfg.legout_multiple * avg_prev_range[i]
-                and body_ratio[i] >= cfg.legout_min_body_ratio):
+        if c[i] > h[i - 1]:
+            leg_out_dir = "R"
+        elif c[i] < l[i - 1]:
+            leg_out_dir = "D"
+        else:
+            continue  # closed inside the previous candle's range: not an impulse
+        if small[i]:
+            continue  # a basing candle can't be the impulse
+        if cfg.legout_multiple is not None and rng[i] < cfg.legout_multiple * avg_prev_range[i]:
             continue
 
         n = 0
@@ -84,7 +93,6 @@ def detect_zones(df, config=None, pip=0.0001):
 
         base = slice(i - n, i)
         leg_in_dir = "R" if c[leg_in] > o[leg_in] else "D"
-        leg_out_dir = "R" if c[i] > o[i] else "D"
         # Far edge (stop side) is always the base's wick extreme; the near (entry) edge is the
         # wick for a single-candle base and the body for a multi-candle base.
         top, bottom = h[base].max(), l[base].min()

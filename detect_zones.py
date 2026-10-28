@@ -92,9 +92,9 @@ def main():
     parser.add_argument("--instrument", default="EUR_USD")
     parser.add_argument("--granularity", nargs="+", default=["H1", "H4"])
     parser.add_argument("--multiple", type=float, default=defaults.legout_multiple,
-                        help="leg-out range vs average prior range (default %(default)s)")
+                        help="optional impulse strength filter: range vs average prior range (default: off)")
     parser.add_argument("--lookback", type=int, default=defaults.legout_lookback,
-                        help="candles averaged for the leg-out comparison (default %(default)s)")
+                        help="candles averaged for the strength filter (default %(default)s)")
     parser.add_argument("--min-base", type=int, default=defaults.min_base_candles)
     parser.add_argument("--max-base", type=int, default=defaults.max_base_candles)
     parser.add_argument("--plots-per-type", type=int, default=1,

@@ -19,6 +19,9 @@ Usage:
     python backtest.py                                        # EUR_USD, all data before the hold-out
     python backtest.py --start 2024-10-28                     # the original 18-month window
     python backtest.py --instruments GBP_USD AUD_USD USD_JPY  # other pairs
+
+The grid runs ATR buffer 0.1 / 0.2 / 0.25 against the optional impulse strength
+filter: off (default) / 2x / 2.5x / 3x the recent average range.
 """
 
 import argparse
@@ -44,7 +47,7 @@ TIMEFRAMES = {"H1": pd.Timedelta("1h"), "H4": pd.Timedelta("4h"), "D": pd.Timede
 BUFFERS = [0.1, 0.2, 0.25]
 HOLDOUT_FROM = "2026-04-28"  # last ~6 months, kept for final validation
 SPREAD_PIPS = {"EUR_USD": 1.2, "GBP_USD": 1.6, "AUD_USD": 1.4, "USD_JPY": 1.4}  # typical practice spreads
-MULTIPLES = [2.0, 2.5, 3.0]
+MULTIPLES = [None, 2.0, 2.5, 3.0]  # optional impulse strength filter; None = off (the default)
 
 
 @dataclass
@@ -258,12 +261,13 @@ def run_grid(instrument, start, holdout, base_cfg, news, write_logs=True):
             cfg = replace(base_cfg, atr_buffer=buffer)
             trades = simulate(zones, market, cfg, pip)
             if write_logs:
-                tag = f"{instrument}_H1_m{multiple}_b{buffer}_{start:%Y%m%d}" if start is not None else \
-                    f"{instrument}_H1_m{multiple}_b{buffer}"
+                tag = f"{instrument}_H1_m{multiple or 'off'}_b{buffer}_{start:%Y%m%d}" if start is not None else \
+                    f"{instrument}_H1_m{multiple or 'off'}_b{buffer}"
                 trades.to_csv(OUT_DIR / f"trades_{tag}.csv", index=False)
             filled = trades[trades["status"] == "filled"]
             lol = filled[filled["level_on_level"]]
-            grid.append({"instrument": instrument, "multiple": multiple, "atr_buffer": buffer,
+            grid.append({"instrument": instrument, "multiple": "off" if multiple is None else multiple,
+                         "atr_buffer": buffer,
                          **summarize(trades, cfg), "lol_trades": len(lol),
                          "lol_expectancy_r": round(lol["r_multiple"].mean(), 3) if len(lol) else np.nan})
     return pd.DataFrame(grid)
@@ -294,7 +298,7 @@ def main():
         cfg = BacktestConfig(spread_pips=spread, risk_per_trade=args.risk)
         res = run_grid(instrument, start, holdout, cfg, news)
         results.append(res)
-        base = res[(res["multiple"] == 2.5) & (res["atr_buffer"] == 0.1)]
+        base = res[(res["multiple"] == "off") & (res["atr_buffer"] == 0.1)]
         print(base.drop(columns=["instrument", "multiple", "atr_buffer"]).T.to_string(header=False), "\n")
 
     results = pd.concat(results, ignore_index=True)

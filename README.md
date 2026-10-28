@@ -64,15 +64,17 @@ python detect_zones.py
 How a zone is found (`zones.py`):
 
 1. ATR (14, Wilder) is calculated on each timeframe.
-2. A **leg-out** is a candle whose range is at least **2.5×** the average range of
-   the 10 candles before it, with a body of at least 50% of its range.
-3. The **base** is the 1–3 small candles right before the leg-out (body ≤ 50% of
-   range, range ≤ 1× ATR). If the run of small candles is longer than the max,
-   it's rejected as a consolidation, not a base.
+2. A **basing candle** has a body ≤ 50% of its range and a range ≤ 1× ATR.
+3. The **leg-out is an impulse candle**: a non-basing candle right after 1–5
+   basing candles that closes outside the previous candle's range. Closing above
+   the previous high makes a demand zone; closing below the previous low, a
+   supply zone. A run of more than 5 basing candles is consolidation, not a base.
+   An optional strength filter (`legout_multiple`, off by default) also requires
+   the impulse to be N× the average range of the previous 10 candles.
 4. The candle before the base is the **leg-in**. Leg-in and leg-out direction
    give the type: RBR / DBR (demand), DBD / RBD (supply).
-5. Edges: a single-candle base uses its wick high/low; a multi-candle base uses
-   the highest/lowest candle body.
+5. Edges: the far (stop) edge is the base's wick extreme; the entry edge is the
+   wick for a single-candle base and the body for a multi-candle base.
 
 Output:
 
@@ -144,7 +146,7 @@ python backtest.py --instruments GBP_USD AUD_USD USD_JPY  # other pairs (per-pai
   first. Weekend gaps fill at the gap price.
 - Results are in R of the full per-trade risk (1% by default): a stop-out with
   only the first entry is −⅓R.
-- Grid: ATR buffer 0.1 / 0.2 / 0.25 × leg-out multiple 2 / 2.5 / 3.
+- Grid: ATR buffer 0.1 / 0.2 / 0.25 × impulse strength filter off / 2× / 2.5× / 3×.
 
 Output in `output/backtest/`: `trades_<instrument>_H1_m<multiple>_b<buffer>.csv`
 (every zone: plan, filter verdict, fill, adds, exit, R) and `grid_results.csv`.
