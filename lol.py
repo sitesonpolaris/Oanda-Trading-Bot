@@ -4,8 +4,9 @@ zone stacked on it in the same move.
 Long (short is the mirror image):
   1. Downtrend: when the DBR's rally starts, the last two H1 swing highs and lows
      are lower highs and lower lows.
-  2. Reversal: a DBR demand zone. It doesn't need the 2x move-out (the break of
-     structure is the strength test).
+  2. Reversal: a DBR demand zone. Neither the DBR nor the RBR needs the
+     move-out strength rules (2x the base, taller than the move-in) or the 2x
+     move away: the break of structure is the strength test.
   3. Level on level (drop-base-rally-base-rally): the RBR demand zone that follows
      the DBR in the same rally and breaks structure: by the close of the RBR's
      move-out, price has closed above the lower high that stood when the DBR's
@@ -14,7 +15,7 @@ Long (short is the mirror image):
      the DBR, and after the break doesn't close back below the broken level.
      `pause_candles` counts the candles from the DBR's move-out to the RBR's base;
      `max_pause_candles` (None = no limit) caps it.
-  4. Entry: limit order at the top of the RBR once the RBR is valid (2x move away).
+  4. Entry: limit order at the top of the RBR from the candle after its move-out.
   5. Stop: bottom of the RBR minus `atr_buffer` x the daily ATR.
   6. Trend: not required. The break of structure and the stacked zone are the
      momentum signal, so the setup is traded even against the D1/H4 trend.
@@ -51,9 +52,11 @@ class LoLConfig:
     atr_buffer: float = 0.1          # fraction of the daily ATR
     min_reward_risk: float = 2.0
     spread_pips: float = 1.2
-    zones: ZoneConfig = field(default_factory=ZoneConfig)
-    # The reversal zone doesn't need the move-out to be 2x the base.
-    reversal_impulse_vs_base: float | None = None
+    zones: ZoneConfig = field(default_factory=ZoneConfig)  # target zones: the full course rules
+    # The DBR and the RBR don't need the move-out strength rules or the 2x move away: the break of
+    # structure is the strength test.
+    setup_zones: ZoneConfig = field(default_factory=lambda: ZoneConfig(
+        require_breakout=False, min_impulse_vs_base=None, move_out_taller_than_move_in=False, min_move_away=None))
     # Most candles from the DBR's move-out to the start of the RBR's base (None = no limit).
     max_pause_candles: int | None = None
 
@@ -63,9 +66,7 @@ def find_setups(h1, cfg=None, pip=0.0001):
     cfg = cfg or LoLConfig()
     h1 = h1.reset_index(drop=True)
     times = h1["time"]
-    no_breakout = {**cfg.zones.__dict__, "require_breakout": False}
-    reversals = detect_zones(h1, ZoneConfig(**{**no_breakout, "min_impulse_vs_base": cfg.reversal_impulse_vs_base}), pip=pip)
-    continuations = detect_zones(h1, ZoneConfig(**no_breakout), pip=pip)
+    reversals = continuations = detect_zones(h1, cfg.setup_zones, pip=pip)
     ms = market_structure(h1, SWINGS_ONLY)
     trend = ms["trend"].to_numpy()
     lo, hi, c = h1["low"].to_numpy(), h1["high"].to_numpy(), h1["close"].to_numpy()
