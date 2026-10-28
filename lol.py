@@ -11,7 +11,11 @@ Long (short is the mirror image):
      real pullback.
   4. Entry: limit order at the top of the RBR once the RBR is valid (2x move away).
   5. Stop: bottom of the RBR minus `atr_buffer` x the daily ATR.
-  6. Target (when price comes back to the RBR): `target_fraction` (80%) of the
+  6. Trend: not required. The break of structure and the stacked zone are the
+     momentum signal, so the setup is traded even against the D1/H4 trend.
+     Each setup records whether D1 and H4 agreed (`trend_aligned`), so aligned
+     and countertrend setups can be compared.
+  7. Target (when price comes back to the RBR): `target_fraction` (80%) of the
      way to the nearest unbroken H1 supply zone above; if there is none, the
      RBR's move-out distance (top of the RBR to the high before the return)
      projected from the entry. Under `min_reward_risk`, no trade.
@@ -27,7 +31,8 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
-from backtest import HOLDOUT_FROM, OUT_DIR, SPREAD_PIPS, TIMEFRAMES, build_market, exit_after_fill, first_true, load
+from backtest import (HOLDOUT_FROM, OUT_DIR, SPREAD_PIPS, build_market, exit_after_fill, first_true, load,
+                      state_at_bars)
 from strategy import active_at
 from structure import StructureConfig, find_swings, market_structure
 from zones import ZoneConfig, detect_zones, pip_size
@@ -94,6 +99,7 @@ def simulate(setups, market, cfg, pip):
     daily_atr = pd.merge_asof(bars[["time"]], market.d1_atr.sort_values("available_time"),
                               left_on="time", right_on="available_time")["atr"].to_numpy()
     h1_zones = market.all_zones[market.all_zones["tf"] == "H1"]
+    d1, h4 = state_at_bars(bars, market.d1, ["trend"])["trend"], state_at_bars(bars, market.h4, ["trend"])["trend"]
     out = []
     for s in setups.itertuples(index=False):
         long = s.side == "long"
@@ -106,6 +112,8 @@ def simulate(setups, market, cfg, pip):
         if order >= len(bars) or np.isnan(daily_atr[order]):
             row["status"] = "untouched"
             continue
+        want = "up" if long else "down"
+        row.update(d1_trend=d1[order], h4_trend=h4[order], trend_aligned=d1[order] == want and h4[order] == want)
         buffer = cfg.atr_buffer * daily_atr[order]
         entry, stop = (s.cont_top, s.cont_bottom - buffer) if long else (s.cont_bottom, s.cont_top + buffer)
         risk = abs(entry - stop)
