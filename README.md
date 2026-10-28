@@ -104,9 +104,11 @@ Implements the strategy spec (Oct 10, 2026). The same rules drive the backtest
 and the live bot.
 
 - **Timeframes:** trend on D1, momentum on H4, zones and entries on H1.
-- **Direction:** H4 momentum must agree with the trade, and so must the D1 trend.
-  A countertrend trade is allowed only once a D1 break of structure has
-  neutralised the opposing trend.
+- **Direction:** H4 momentum must have agreed with the trade when the zone
+  formed (price has to pull back against the trade to reach the zone, which
+  turns momentum, so it isn't checked at the touch). The D1 trend must agree
+  when price returns; a countertrend trade is allowed only once a D1 break of
+  structure has neutralised the opposing trend.
 - **Zone edges:** entry at the wick (single-candle base) or body (multi-candle
   base); stop beyond the base's wick extreme + 0.1 × ATR.
 - **Target:** 80% of the impulse, measured from the zone's origin (far edge) to
@@ -128,12 +130,15 @@ All settings live in `StrategyConfig`.
 ## Backtest
 
 ```bash
-python fetch_candles.py --granularity D    # daily candles, needed for the trend
-python backtest.py
+python fetch_candles.py --instrument EUR_USD --granularity H1 H4 D --years 8
+python backtest.py                                        # all EUR_USD data before the hold-out
+python backtest.py --start 2024-10-28                     # the original 18-month window
+python backtest.py --holdout-from 2024-10-28              # EUR_USD 2018-2024 only
+python backtest.py --instruments GBP_USD AUD_USD USD_JPY  # other pairs (per-pair spreads)
 ```
 
-- Uses only the **first 18 months** of data; the rest is cut off before anything
-  is computed and kept for validation.
+- Everything from **2026-04-28** on is held out for final validation and cut off
+  before anything is computed, for every pair (`--holdout-from` can move the cutoff earlier).
 - Simulated on H1 candles with a 1.2-pip spread (buys fill on the ask, sells on
   the bid, adds included). If a candle hits stop and target, the stop counts
   first. Weekend gaps fill at the gap price.

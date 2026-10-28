@@ -51,3 +51,11 @@ def test_scale_in_signal_after_bos_since_last_entry():
     assert (adds[0].stop, adds[0].target, adds[0].entry) == (1.0989, 1.1038, b["close"].iat[-1])
     old_bos = [""] * 1 + ["bullish"] + [""] * 5  # before the entry: no add
     assert add_signals([trade], market(b, h1_bos=old_bos), CFG, now_after(b)) == []
+
+
+def test_live_momentum_check_uses_zone_formation_time():
+    b = bars(SETUP)
+    m = market(b)
+    m.h4 = pd.DataFrame({"available_time": [T0 - pd.Timedelta(days=1), T0 + pd.Timedelta(hours=5)],
+                         "trend": ["up", "down"]})
+    assert evaluate_zones(pd.DataFrame([zone()]), m, CFG, PIP, now_after(b))[0].status == "signal"

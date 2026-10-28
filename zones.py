@@ -16,6 +16,7 @@ body for a multi-candle base: top of the bodies for demand, bottom for supply.
 
 from dataclasses import dataclass
 
+import numpy as np
 import pandas as pd
 
 ZONE_COLUMNS = [
@@ -62,7 +63,7 @@ def detect_zones(df, config=None, pip=0.0001):
     o, h, l, c = (df[col].to_numpy() for col in ("open", "high", "low", "close"))
     rng = h - l
     body = abs(c - o)
-    body_ratio = pd.Series(body / rng).fillna(0).to_numpy()
+    body_ratio = np.divide(body, rng, out=np.zeros_like(rng), where=rng > 0)  # zero-range candles -> 0
     atr_vals = atr(df, cfg.atr_period).to_numpy()
     avg_prev_range = pd.Series(rng).rolling(cfg.legout_lookback).mean().shift().to_numpy()
     small = (body_ratio <= cfg.base_max_body_ratio) & (rng <= cfg.base_max_atr * atr_vals)

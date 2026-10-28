@@ -92,3 +92,13 @@ def test_summary_metrics():
     assert s["trades"] == 4 and s["win_rate_%"] == 50.0 and s["avg_adds"] == 0.75
     assert s["total_return_%"] == pytest.approx((1.02 * 0.99 * 0.99 * 1.03 - 1) * 100, abs=0.01)
     assert s["max_drawdown_%"] == pytest.approx(1.99, abs=0.01)
+
+
+def test_h4_momentum_is_checked_when_zone_forms_not_at_touch():
+    b = bars(SETUP + [TOUCH, WIN])
+    m = market(b)
+    turned = T0 + pd.Timedelta(hours=5)  # momentum turns down during the pullback, before the touch
+    m.h4 = pd.DataFrame({"available_time": [T0 - pd.Timedelta(days=1), turned], "trend": ["up", "down"]})
+    assert simulate(pd.DataFrame([zone()]), m, NO_SPREAD, PIP).iloc[0].status == "filled"
+    m.h4 = pd.DataFrame({"available_time": [T0 - pd.Timedelta(days=1), turned], "trend": ["down", "up"]})
+    assert simulate(pd.DataFrame([zone()]), m, NO_SPREAD, PIP).iloc[0].status == "skipped_trend"

@@ -1,6 +1,6 @@
 """Backtest the strategy spec on the in-sample period only.
 
-Rules (see strategy.py): H1 zones, D1 trend + H4 momentum, limit entry at the
+Rules (see strategy.py): H1 zones, D1 trend + H4 momentum at zone formation, limit entry at the
 zone's near edge once the impulse extreme is confirmed, stop beyond the far edge
 + ATR buffer, target at 80% of the impulse from its origin, playing-field filters
 (room to opposing zone, erratic wicks, news), a one-third first entry with up to
@@ -12,12 +12,13 @@ both stop and target, the stop is assumed to come first. A setup's result is in 
 of the full per-trade risk: a stop-out with all three entries is -1R, a stop-out
 with only the first entry is -1/3R.
 
-The last part of the data (everything after `--in-sample-months`) is cut off
-before anything is computed.
+Everything from HOLDOUT_FROM (2026-04-28) on is cut off before anything is
+computed, for every instrument.
 
 Usage:
-    python backtest.py                      # baseline + parameter grid
-    python backtest.py --spread 1.0 --risk 0.005
+    python backtest.py                                        # EUR_USD, all data before the hold-out
+    python backtest.py --start 2024-10-28                     # the original 18-month window
+    python backtest.py --instruments GBP_USD AUD_USD USD_JPY  # other pairs
 """
 
 import argparse
@@ -41,6 +42,8 @@ NEWS_PATH = DATA_DIR / "news_events.csv"
 
 TIMEFRAMES = {"H1": pd.Timedelta("1h"), "H4": pd.Timedelta("4h"), "D": pd.Timedelta("1D")}
 BUFFERS = [0.1, 0.2, 0.25]
+HOLDOUT_FROM = "2026-04-28"  # last ~6 months, kept for final validation
+SPREAD_PIPS = {"EUR_USD": 1.2, "GBP_USD": 1.6, "AUD_USD": 1.4, "USD_JPY": 1.4}  # typical practice spreads
 MULTIPLES = [2.0, 2.5, 3.0]
 
 
@@ -166,7 +169,8 @@ def simulate(zones, market, cfg, pip):
         t = times.iat[f]
         row["entry_time"] = t
 
-        ok, why = direction_check(long, d1["trend"][f], d1["last_bos"][f], h4["trend"][f], cfg)
+        formed = min(legout + 1, len(bars) - 1)  # first bar after the leg-out closed
+        ok, why = direction_check(long, d1["trend"][f], d1["last_bos"][f], h4["trend"][formed], cfg)
         row["reason"] = why
         if not ok:
             row["status"] = "skipped_trend"
@@ -229,62 +233,75 @@ def summarize(trades, cfg):
     }
 
 
-def load(instrument, granularity, before):
+def load(instrument, granularity, before, start=None):
     path = DATA_DIR / f"{instrument}_{granularity}.csv"
     if not path.exists():
-        sys.exit(f"Error: {path} not found. Run: python fetch_candles.py --granularity {granularity}")
+        sys.exit(f"Error: {path} not found. Run: python fetch_candles.py --instrument {instrument} "
+                 f"--granularity H1 H4 D --years 8")
     df = pd.read_csv(path, parse_dates=["time"])
-    # Keep only candles that had closed before the split.
-    return df[df["time"] + TIMEFRAMES[granularity] <= before].reset_index(drop=True)
+    # Keep only candles that had closed before the hold-out cutoff.
+    keep = df["time"] + TIMEFRAMES[granularity] <= before
+    if start is not None:
+        keep &= df["time"] >= start
+    return df[keep].reset_index(drop=True)
+
+
+def run_grid(instrument, start, holdout, base_cfg, news, write_logs=True):
+    pip = pip_size(instrument)
+    h1, h4, d1 = (load(instrument, g, holdout, start) for g in ("H1", "H4", "D"))
+    print(f"== {instrument}: {h1['time'].iat[0]:%Y-%m-%d} -> {h1['time'].iat[-1]:%Y-%m-%d %H:%M} UTC "
+          f"({len(h1):,} H1 bars), spread {base_cfg.spread_pips} pips")
+    grid = []
+    for multiple in MULTIPLES:
+        market, zones = build_market(h1, h4, d1, ZoneConfig(legout_multiple=multiple), instrument, pip, news)
+        for buffer in BUFFERS:
+            cfg = replace(base_cfg, atr_buffer=buffer)
+            trades = simulate(zones, market, cfg, pip)
+            if write_logs:
+                tag = f"{instrument}_H1_m{multiple}_b{buffer}_{start:%Y%m%d}" if start is not None else \
+                    f"{instrument}_H1_m{multiple}_b{buffer}"
+                trades.to_csv(OUT_DIR / f"trades_{tag}.csv", index=False)
+            filled = trades[trades["status"] == "filled"]
+            lol = filled[filled["level_on_level"]]
+            grid.append({"instrument": instrument, "multiple": multiple, "atr_buffer": buffer,
+                         **summarize(trades, cfg), "lol_trades": len(lol),
+                         "lol_expectancy_r": round(lol["r_multiple"].mean(), 3) if len(lol) else np.nan})
+    return pd.DataFrame(grid)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--instrument", default="EUR_USD")
-    parser.add_argument("--spread", type=float, default=BacktestConfig.spread_pips, help="pips")
+    parser.add_argument("--instruments", nargs="+", default=["EUR_USD"])
+    parser.add_argument("--start", help="first candle date (UTC), default: all data in the file")
+    parser.add_argument("--holdout-from", default=HOLDOUT_FROM,
+                        help="validation data from this date is never used (default %(default)s)")
+    parser.add_argument("--spread", type=float, help="pips; default per instrument from SPREAD_PIPS")
     parser.add_argument("--risk", type=float, default=BacktestConfig.risk_per_trade,
                         help="full per-trade risk as a fraction of equity")
-    parser.add_argument("--in-sample-months", type=int, default=18)
     args = parser.parse_args()
 
-    pip = pip_size(args.instrument)
-    first = pd.read_csv(DATA_DIR / f"{args.instrument}_H1.csv", nrows=1, parse_dates=["time"])["time"].iat[0]
-    split = (first + pd.DateOffset(months=args.in_sample_months)).normalize()
-    h1, h4, d1 = (load(args.instrument, g, split) for g in ("H1", "H4", "D"))
+    holdout = pd.Timestamp(args.holdout_from, tz="UTC")
+    start = pd.Timestamp(args.start, tz="UTC") if args.start else None
     news = load_news(NEWS_PATH)
-    print(f"In-sample: {h1['time'].iat[0]:%Y-%m-%d} -> {h1['time'].iat[-1]:%Y-%m-%d %H:%M} UTC "
-          f"({len(h1):,} H1 bars). Held out for validation: everything from {split:%Y-%m-%d}.")
-    print(f"Spread {args.spread} pips, full risk {args.risk:.1%} per setup (entries of 1/3), compounding.")
+    print(f"Held out for validation: everything from {holdout:%Y-%m-%d}. Full risk {args.risk:.1%} per setup "
+          f"(entries of 1/3), compounding.")
     print(f"News filter: {f'{len(news)} high-impact events' if news is not None else 'off (no data/news_events.csv)'}\n")
 
-    base_cfg = BacktestConfig(spread_pips=args.spread, risk_per_trade=args.risk)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    grid = []
-    for multiple in MULTIPLES:
-        market, zones = build_market(h1, h4, d1, ZoneConfig(legout_multiple=multiple), args.instrument, pip, news)
-        if multiple == 2.5:
-            for name, s in (("D1 trend", market.d1), ("H4 momentum", market.h4)):
-                share = s["trend"].value_counts(normalize=True).mul(100).round(1).to_dict()
-                print(f"{name} share: {share}")
-            print()
-        for buffer in BUFFERS:
-            cfg = replace(base_cfg, atr_buffer=buffer)
-            trades = simulate(zones, market, cfg, pip)
-            trades.to_csv(OUT_DIR / f"trades_{args.instrument}_H1_m{multiple}_b{buffer}.csv", index=False)
-            filled = trades[trades["status"] == "filled"]
-            lol = filled[filled["level_on_level"]]
-            grid.append({"multiple": multiple, "atr_buffer": buffer, **summarize(trades, cfg),
-                         "lol_trades": len(lol),
-                         "lol_expectancy_r": round(lol["r_multiple"].mean(), 3) if len(lol) else np.nan})
+    results = []
+    for instrument in args.instruments:
+        spread = args.spread if args.spread is not None else SPREAD_PIPS.get(instrument, 1.5)
+        cfg = BacktestConfig(spread_pips=spread, risk_per_trade=args.risk)
+        res = run_grid(instrument, start, holdout, cfg, news)
+        results.append(res)
+        base = res[(res["multiple"] == 2.5) & (res["atr_buffer"] == 0.1)]
+        print(base.drop(columns=["instrument", "multiple", "atr_buffer"]).T.to_string(header=False), "\n")
 
-    results = pd.DataFrame(grid)
+    results = pd.concat(results, ignore_index=True)
     results.to_csv(OUT_DIR / "grid_results.csv", index=False)
     pd.set_option("display.width", 250)
-    base = results[(results["multiple"] == 2.5) & (results["atr_buffer"] == 0.1)]
-    print("== Baseline (multiple 2.5, buffer 0.1 ATR)")
-    print(base.drop(columns=["multiple", "atr_buffer"]).T.to_string(header=False), "\n")
-    cols = ["multiple", "atr_buffer", "trades", "win_rate_%", "avg_planned_rr", "avg_win_r", "avg_loss_r",
-            "expectancy_r", "total_return_%", "max_drawdown_%", "avg_adds", "lol_trades", "lol_expectancy_r"]
+    cols = ["instrument", "multiple", "atr_buffer", "trades", "win_rate_%", "avg_planned_rr", "avg_win_r",
+            "avg_loss_r", "expectancy_r", "total_return_%", "max_drawdown_%", "avg_adds", "lol_trades"]
     print("== Parameter grid")
     print(results[cols].to_string(index=False))
     print(f"\nTrade logs and grid_results.csv in {OUT_DIR.relative_to(ROOT)}/")

@@ -10,8 +10,11 @@ For a demand zone (supply is the mirror image):
      `atr_buffer` x ATR, target at `target_fraction` of the impulse from the origin.
   3. Filters, checked when price comes back to the zone:
      - reward:risk at least `min_reward_risk`
-     - direction: H4 momentum up and D1 trend up; or, countertrend, D1 trend
-       neutralised by a bullish D1 break of structure (H4 momentum still up)
+     - direction: H4 momentum was up when the zone formed (the leg-out candle
+       closed), and the D1 trend is up when price returns; or, countertrend,
+       the D1 trend has been neutralised by a bullish D1 break of structure.
+       Momentum is checked at formation, not at the return, because price must
+       pull back against the trade to reach the zone, which turns momentum.
      - no high-impact news for either currency inside the news window
      - market not erratic: fewer than `max_big_wicks` of the last `wick_lookback`
        H1 candles have wicks of at least `wick_atr` x ATR
@@ -74,11 +77,11 @@ def impulse_extreme(kind, highs, lows, swing_high, swing_low, legout_idx, streng
     return j + strength, lows[legout_idx:j + 1].min()
 
 
-def direction_check(long, d1_trend, d1_last_bos, h4_trend, cfg):
-    """(allowed, reason) for trading in this direction given D1 trend and H4 momentum."""
+def direction_check(long, d1_trend, d1_last_bos, h4_at_formation, cfg):
+    """(allowed, reason) given the D1 trend now and the H4 momentum when the zone formed."""
     want, bos_want = ("up", "bullish") if long else ("down", "bearish")
-    if h4_trend != want:
-        return False, f"H4 momentum {h4_trend}"
+    if h4_at_formation != want:
+        return False, f"H4 momentum {h4_at_formation} when zone formed"
     if d1_trend == want:
         return True, "with D1 trend"
     if cfg.allow_countertrend_with_bos and d1_trend == "sideways" and d1_last_bos == bos_want:

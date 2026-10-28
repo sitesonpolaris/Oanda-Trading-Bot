@@ -6,7 +6,7 @@ wasn't traded:
     touched           price already came back to the zone (not fresh)
     waiting_impulse   the impulse extreme isn't confirmed by a swing yet
     skipped_rr        target < min_reward_risk x stop distance
-    skipped_trend     D1 trend / H4 momentum don't allow this direction
+    skipped_trend     D1 trend now / H4 momentum at zone formation don't allow this direction
     skipped_news      high-impact news within the window
     skipped_erratic   too many big wicks recently
     skipped_room      opposing zone too close
@@ -58,9 +58,8 @@ def evaluate_zones(zones, market, cfg, pip, now):
     bars = market.bars
     h, l = bars["high"].to_numpy(), bars["low"].to_numpy()
     swings = find_swings(bars, cfg.impulse_swing_strength)
-    d1, h4 = latest(market.d1, now), latest(market.h4, now)
+    d1 = latest(market.d1, now)
     d1_trend, d1_bos = (d1["trend"], d1["last_bos"]) if d1 is not None else ("sideways", "")
-    h4_trend = h4["trend"] if h4 is not None else "sideways"
     h1_bos = {"long": _last_bos_time(market.h1, "bullish", now), "short": _last_bos_time(market.h1, "bearish", now)}
     big_wicks = recent_big_wicks(bars, cfg)
     news = news_conflict(market.news, market.instrument, now, now + H1, cfg)
@@ -87,7 +86,8 @@ def evaluate_zones(zones, market, cfg, pip, now):
         entry, stop, target = plan_trade(z, confirmed[1], cfg, pip)
         risk, reward = abs(entry - stop), (target - entry) * (1 if long else -1)
         plan = f"{z.type}{tag} entry {entry:.5f} SL {stop:.5f} TP {target:.5f} RR {reward / risk:.2f}"
-        ok, why = direction_check(long, d1_trend, d1_bos, h4_trend, cfg)
+        h4 = latest(market.h4, z.legout_time + H1)  # momentum when the zone formed
+        ok, why = direction_check(long, d1_trend, d1_bos, h4["trend"] if h4 is not None else "sideways", cfg)
         room = room_to_opposing(long, entry, now, market.all_zones)
         if reward < cfg.min_reward_risk * risk:
             status, detail = "skipped_rr", f"{plan}: below {cfg.min_reward_risk}R"
