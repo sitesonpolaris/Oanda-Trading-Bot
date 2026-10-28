@@ -59,3 +59,11 @@ def test_live_momentum_check_uses_zone_formation_time():
     m.h4 = pd.DataFrame({"available_time": [T0 - pd.Timedelta(days=1), T0 + pd.Timedelta(hours=5)],
                          "trend": ["up", "down"]})
     assert evaluate_zones(pd.DataFrame([zone()]), m, CFG, PIP, now_after(b))[0].status == "signal"
+
+
+def test_waits_for_breakout_and_skips_untraded_types():
+    b = bars(SETUP)
+    m = market(b)
+    waiting = evaluate_zones(pd.DataFrame([zone(breakout_time=pd.NaT)]), m, CFG, PIP, now_after(b))[0]
+    assert waiting.status == "waiting_breakout"
+    assert evaluate_zones(pd.DataFrame([zone(type="DBR")]), m, CFG, PIP, now_after(b)) == []

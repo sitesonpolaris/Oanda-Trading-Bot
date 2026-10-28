@@ -1,7 +1,7 @@
 """Hand-built H1 market for strategy, backtest and signal tests.
 
-Demand zone 1.0990-1.1000 (ATR 10 pips), leg-out at bar 2, so the limit order goes
-in at bar 3. The default opposing supply zone starts at 1.1050, so the plan is:
+Demand zone 1.0990-1.1000 (ATR 10 pips), leg-out (and breakout) at bar 2, so the
+limit order goes in at bar 3. The default opposing supply zone starts at 1.1050, so the plan is:
 entry 1.1000, stop 1.0989, target 1.1000 + 0.8 x 50 pips = 1.1040 (3.64R).
 Bars 3-6 stay above the zone, bar 7 touches it, bar 8 reaches the target.
 """
@@ -30,7 +30,9 @@ def bars(rows):
 
 def zone(kind="demand", top=1.1000, bottom=1.0990, start=None, legout_bar=2, **extra):
     start = start if start is not None else T0 + pd.Timedelta(hours=legout_bar - 1)
-    return {"start_time": start, "legout_time": T0 + pd.Timedelta(hours=legout_bar), "type": "RBR" if
+    legout = T0 + pd.Timedelta(hours=legout_bar)
+    return {"start_time": start, "legout_time": legout, "breakout_time": legout, "breakout_level": top + 0.0010,
+            "type": "RBR" if
             kind == "demand" else "DBD", "kind": kind, "top": top, "bottom": bottom, "base_candles": 1,
             "impulse_pips": 30, "impulse_ratio": 3.0, "impulse_atr": 3.0, "atr_pips": 10, **extra}
 

@@ -3,6 +3,7 @@
 Each H1 zone gets a verdict with a reason, so the bot can log why it was or
 wasn't traded:
 
+    waiting_breakout  the impulse hasn't broken the prior swing yet
     touched           price already came back to the zone (not fresh)
     no_opposing_zone  no active opposing zone to aim for when the zone formed
     skipped_rr        target < min_reward_risk x stop distance
@@ -18,6 +19,7 @@ structure in its favour that happened after its latest entry.
 from dataclasses import dataclass
 
 import numpy as np
+import pandas as pd
 
 from risk_manager import Signal
 from strategy import big_wicks, direction_check, level_on_level, news_conflict, opposing_edge, plan_trade
@@ -62,6 +64,8 @@ def evaluate_zones(zones, market, cfg, pip, now):
 
     verdicts = []
     for z in zones.itertuples(index=False):
+        if z.type not in cfg.trade_types:
+            continue
         sid = setup_id(market.instrument, z)
         long = z.kind == "demand"
         lol = level_on_level(z, market.all_zones, z.atr_pips * pip, cfg)
@@ -72,7 +76,13 @@ def evaluate_zones(zones, market, cfg, pip, now):
             verdicts.append(ZoneVerdict(sid, z, "touched", f"{z.type}{tag}: price already returned to the zone",
                                         level_on_level=lol))
             continue
-        edge = opposing_edge(long, near, z.legout_time + H1, market.all_zones)  # as of zone formation
+        if pd.isna(z.breakout_time):
+            verdicts.append(ZoneVerdict(sid, z, "waiting_breakout",
+                                        f"{z.type}{tag}: waiting for a close beyond {z.breakout_level:.5f}",
+                                        level_on_level=lol))
+            continue
+        valid_from = z.breakout_time + H1
+        edge = opposing_edge(long, near, valid_from, market.all_zones)  # as of the breakout
         if edge is None:
             verdicts.append(ZoneVerdict(sid, z, "no_opposing_zone", f"{z.type}{tag}: no opposing zone to aim for",
                                         level_on_level=lol))
@@ -81,7 +91,7 @@ def evaluate_zones(zones, market, cfg, pip, now):
         entry, stop, target = plan_trade(z, edge, cfg, pip)
         risk, reward = abs(entry - stop), (target - entry) * (1 if long else -1)
         plan = f"{z.type}{tag} entry {entry:.5f} SL {stop:.5f} TP {target:.5f} RR {reward / risk:.2f}"
-        h4 = latest(market.h4, z.legout_time + H1)  # momentum when the zone formed
+        h4 = latest(market.h4, valid_from)  # momentum when the zone became valid
         ok, why = direction_check(long, d1_trend, d1_bos, h4["trend"] if h4 is not None else "sideways", cfg)
         if reward < cfg.min_reward_risk * risk:
             status, detail = "skipped_rr", f"{plan}: below {cfg.min_reward_risk}R"

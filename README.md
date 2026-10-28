@@ -61,24 +61,23 @@ Finds supply/demand zones in the saved CSVs (no API calls, no orders):
 python detect_zones.py
 ```
 
-How a zone is found (`zones.py`):
+How a zone is found (`zones.py`), following the TWP course "Supply and Demand –
+Steps to Drawing Zones":
 
-1. ATR (14, Wilder) is calculated on each timeframe.
-2. A **basing candle** has a body ≤ 50% of its range and a range ≤ 1× ATR.
-   Only **strong** zones are kept: the move-out impulse is at least 2× the range
-   of the largest basing candle (`min_impulse_vs_base`).
-3. The **leg-out is an impulse candle**: a non-basing candle right after 1–5
-   basing candles that closes outside the previous candle's range. Closing above
-   the previous high makes a demand zone; closing below the previous low, a
-   supply zone. A run of more than 5 basing candles is consolidation, not a base.
-   An optional strength filter (`legout_multiple`, off by default) also requires
-   the impulse to be N× the average range of the previous 10 candles.
-4. The candle before the base must be a **move-in impulse** too (a non-basing
-   candle closing outside the range of the candle before it). The direction of
-   each impulse's break, not its colour, gives the type: RBR / DBR (demand),
-   DBD / RBD (supply).
-5. Edges: the far (stop) edge is the base's wick extreme; the entry edge is the
-   wick for a single-candle base and the body for a multi-candle base.
+1. **Basing candle:** body ≤ 50% of its range. 1–5 of them form the base; more
+   than 5 disqualifies the zone.
+2. **Move-in and move-out candles:** a rally candle is green, closes in the top
+   25% of its range, and closes above the previous candle's high (a drop candle
+   is the mirror image). The move-out must also be at least 2× the biggest
+   basing candle and taller than the move-in.
+3. **Breakout:** the impulse must close beyond the most recent swing high
+   (demand) or swing low (supply) that existed before the base. The zone becomes
+   valid at that close; if price comes back to the zone first, it's void.
+4. **Types:** RBR / DBR (demand), DBD / RBD (supply). The strategy trades RBR and
+   DBD (`trade_types`); all valid zones count as opposing zones for targets.
+5. **Drawing:** one basing candle is wick to wick; with 2–5, a demand zone runs
+   from the highest body (entry) to the lowest wick, a supply zone from the
+   lowest body (entry) to the highest wick.
 
 Output:
 
@@ -117,14 +116,14 @@ and the live bot.
   structure has neutralised the opposing trend.
 - **Zone edges:** entry at the wick (single-candle base) or body (multi-candle
   base); stop beyond the base's wick extreme + 0.1 × ATR.
-- **Strong zones only:** the move-out impulse must be at least 2× the range of
-  the largest basing candle.
+- **Zones:** valid course zones only (see Zone detection); RBR for longs, DBD
+  for shorts.
 - **Target (room):** long trades aim 80% of the way from the top of the demand
   zone to the bottom of the next supply zone above; short trades aim 80% of the
   way from the bottom of the supply zone to the top of the next demand zone
   below (nearest active strong H1 or H4 zone). No opposing zone, no trade; too
   little room fails the 2R minimum. The plan is fixed and the limit order goes
-  in as soon as the move-out candle closes.
+  in as soon as the breakout candle closes.
 - **Playing field:** skip if 5+ of the last 20 H1 candles have wicks ≥ 1× ATR;
   skip within 30 min of high-impact news for either currency.
   The news filter needs `data/news_events.csv` (`time,currency,impact`, UTC)

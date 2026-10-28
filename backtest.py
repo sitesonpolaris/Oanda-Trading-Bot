@@ -1,7 +1,8 @@
 """Backtest the strategy spec on the in-sample period only.
 
-Rules (see strategy.py): strong H1 zones, D1 trend + H4 momentum at zone
-formation, limit entry at the zone's near edge as soon as the zone forms, stop
+Rules (see strategy.py): course zones on H1 (RBR / DBD traded), D1 trend + H4
+momentum at the breakout, limit entry at the zone's near edge as soon as the
+breakout candle closes, stop
 beyond the far edge + ATR buffer, target 80% of the way to the next opposing
 zone, erratic-wick and news filters, a one-third first entry with up to two
 one-third adds on H1 breaks of structure in the trade's favour.
@@ -137,12 +138,17 @@ def simulate(zones, market, cfg, pip):
 
     out = []
     for z in zones.itertuples(index=False):
+        if z.type not in cfg.trade_types:
+            continue
         long = z.kind == "demand"
         row = {"zone_start": z.start_time, "zone_type": z.type, "side": "long" if long else "short",
                "level_on_level": level_on_level(z, market.all_zones, z.atr_pips * pip, cfg),
                "zone_top": z.top, "zone_bottom": z.bottom, "status": "", "reason": ""}
         out.append(row)
-        order = int(times.searchsorted(z.legout_time)) + 1  # order goes in when the move-out candle closes
+        if pd.isna(z.breakout_time):
+            row["status"] = "no_breakout"
+            continue
+        order = int(times.searchsorted(z.breakout_time)) + 1  # order goes in when the breakout candle closes
         if order >= len(bars):
             row["status"] = "untouched"
             continue
@@ -221,7 +227,7 @@ def summarize(trades, cfg):
         "max_drawdown_%": round(100 * drawdown.max(), 2),
         "avg_adds": round(filled["adds"].mean(), 2) if len(r) and "adds" in filled else 0.0,
         "zones": len(trades),
-        **{s: int(counts.get(s, 0)) for s in ("no_opposing_zone", "skipped_rr", "skipped_trend",
+        **{s: int(counts.get(s, 0)) for s in ("no_breakout", "no_opposing_zone", "skipped_rr", "skipped_trend",
                                               "skipped_news", "skipped_erratic", "untouched")},
     }
 

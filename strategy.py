@@ -3,9 +3,10 @@
 Timeframes: trend on D1, momentum on H4, zones and entries on H1.
 
 For a demand zone (supply is the mirror image):
-  1. Zones: strong zones only (move-out impulse >= 2x the basing candles, zones.py).
-  2. Plan, fixed when the zone forms (its move-out candle closes), and the limit
-     order goes in right away:
+  1. Zones: valid course zones (zones.py), traded types `trade_types` (RBR for
+     longs, DBD for shorts by default).
+  2. Plan, fixed when the zone becomes valid (the breakout candle closes), and
+     the limit order goes in right away:
      - entry at the top of the demand zone
      - stop below the zone's far edge minus `atr_buffer` x ATR
      - target `target_fraction` (80%) of the way from the entry to the bottom of
@@ -13,7 +14,7 @@ For a demand zone (supply is the mirror image):
        opposing zone, no trade.
   3. Filters, checked when price comes back to the zone:
      - reward:risk at least `min_reward_risk`
-     - direction: H4 momentum was up when the zone formed, and the D1 trend is
+     - direction: H4 momentum was up when the zone became valid, and the D1 trend is
        up when price returns; or, countertrend, the D1 trend has been
        neutralised by a bullish D1 break of structure. Momentum is checked at
        formation, not at the return, because price must pull back against the
@@ -39,6 +40,7 @@ NEVER = pd.Timestamp.max.tz_localize("UTC")
 
 @dataclass
 class StrategyConfig:
+    trade_types: tuple = ("RBR", "DBD")
     atr_buffer: float = 0.1
     target_fraction: float = 0.8
     min_reward_risk: float = 2.0
@@ -91,12 +93,16 @@ def direction_check(long, d1_trend, d1_last_bos, h4_at_formation, cfg):
 
 
 def zone_lifecycle(zones, candles, tf_delta):
-    """Add available_time (leg-out closed) and broken_time (first close beyond the far edge)."""
+    """Add available_time (breakout candle closed; NaT if no breakout yet) and broken_time (first
+    close beyond the far edge after that)."""
     out = zones.copy()
-    out["available_time"] = out["legout_time"] + tf_delta
+    out["available_time"] = out["breakout_time"] + tf_delta
     closes = candles["close"].to_numpy()
     broken = []
     for z in out.itertuples(index=False):
+        if pd.isna(z.available_time):
+            broken.append(NEVER)
+            continue
         start = int(candles["time"].searchsorted(z.available_time))
         beyond = closes[start:] < z.bottom if z.kind == "demand" else closes[start:] > z.top
         hit = np.flatnonzero(beyond)

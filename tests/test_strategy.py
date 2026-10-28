@@ -37,7 +37,8 @@ def test_direction_check(long, d1, bos, h4, ok):
 
 def test_zone_lifecycle_breaks_on_close_beyond_far_edge():
     b = bars([(1.1000, 1.1010, 1.0995, 1.1005), (1.1005, 1.1008, 1.0985, 1.0988), (1.0988, 1.0990, 1.0980, 1.0985)])
-    zones = pd.DataFrame([{"kind": "demand", "top": 1.1000, "bottom": 1.0990, "legout_time": T0 - pd.Timedelta(hours=1)}])
+    zones = pd.DataFrame([{"kind": "demand", "top": 1.1000, "bottom": 1.0990,
+                           "breakout_time": T0 - pd.Timedelta(hours=1)}])
     out = zone_lifecycle(zones, b, pd.Timedelta("1h"))
     assert out["available_time"].iat[0] == T0
     assert out["broken_time"].iat[0] == T0 + pd.Timedelta(hours=2)  # bar 1 closed below 1.0990

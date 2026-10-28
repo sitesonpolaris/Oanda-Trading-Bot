@@ -127,3 +127,12 @@ def test_summary_metrics():
     assert s["trades"] == 4 and s["win_rate_%"] == 50.0 and s["avg_adds"] == 0.75
     assert s["total_return_%"] == pytest.approx((1.02 * 0.99 * 0.99 * 1.03 - 1) * 100, abs=0.01)
     assert s["max_drawdown_%"] == pytest.approx(1.99, abs=0.01)
+
+
+def test_order_waits_for_breakout_and_only_rbr_dbd_are_traded():
+    late = zone(breakout_time=T0 + pd.Timedelta(hours=6))  # breakout candle closes at 07:00 UTC
+    assert run(SETUP + [TOUCH, WIN], z=late).order_time == T0 + pd.Timedelta(hours=7)
+    assert run(SETUP + [TOUCH, WIN], z=zone(breakout_time=pd.NaT)).status == "no_breakout"
+    b = bars(SETUP + [TOUCH, WIN])
+    dbr = pd.DataFrame([zone(type="DBR")])
+    assert simulate(dbr, market(b), NO_SPREAD, PIP).empty

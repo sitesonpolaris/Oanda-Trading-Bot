@@ -1,26 +1,33 @@
-"""Supply/demand zone detection on saved candle data.
+"""Supply/demand zone detection on saved candle data, following the TWP course
+("Supply and Demand - Steps to Drawing Zones").
 
 Pure analysis: reads OHLC dataframes, returns zones. No API access, no orders.
 
-A zone is three parts: a move-in impulse candle (leg-in), 1-5 basing candles,
-and a move-out impulse candle (leg-out).
+A zone is a move-in candle, 1-5 basing candles, and a move-out candle:
 
-An impulse candle is a non-basing candle that closes outside the range of the
-candle before it: above its high is a rally (R), below its low a drop (D). The
-leg-in is the impulse right before the base; the leg-out is the impulse right
-after it. The leg-out's direction makes it a demand (R) or supply (D) zone.
+  - Basing candle: body <= 50% of its range (wick to wick).
+  - Rally candle (move-in or move-out): green, closes in the top 25% of its range,
+    and closes above the previous candle's high. A drop candle is the mirror
+    image. Neither can be a basing candle.
+  - Move-out: also at least 2x the range of the biggest basing candle and taller
+    than the move-in candle.
+  - More than 5 basing candles disqualifies the zone.
+  - Breakout: the impulse must make a new swing high (demand) or swing low
+    (supply). The reference is the most recent confirmed H1 swing high above the
+    zone that existed before the base formed; the zone becomes valid when a
+    candle closes above it. If price comes back to the zone's entry edge before
+    that, the zone is void. (Mirror image for supply.)
 
-Only strong zones are kept: the leg-out's range must be at least
-`min_impulse_vs_base` (2x) the range of the largest basing candle. Optionally it
-must also be `legout_multiple` times the average range of the candles before it.
-Zone types:
+Zone types (the move-in and move-out directions):
 
     RBR  rally-base-rally  (demand)     DBR  drop-base-rally  (demand)
     DBD  drop-base-drop    (supply)     RBD  rally-base-drop  (supply)
 
-Zone edges: the far edge (where the stop goes) is always the base's wick
-extreme. The near edge (entry) is the wick for a single-candle base and the
-body for a multi-candle base: top of the bodies for demand, bottom for supply.
+The course trades RBR and DBD; the strategy decides which types to trade.
+
+Zone edges: one basing candle is drawn wick to wick. With 2-5, a demand zone
+runs from the highest candle body (entry) to the lowest wick (stop side); a
+supply zone from the lowest candle body (entry) to the highest wick.
 """
 
 from dataclasses import dataclass
@@ -28,27 +35,32 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
+from structure import find_swings
+
 ZONE_COLUMNS = [
-    "start_time", "legout_time", "type", "kind", "top", "bottom", "base_candles",
-    "impulse_pips", "impulse_ratio", "impulse_vs_base", "impulse_atr", "atr_pips",
+    "start_time", "legout_time", "breakout_time", "breakout_level", "type", "kind", "top", "bottom",
+    "base_candles", "impulse_pips", "impulse_ratio", "impulse_vs_base", "impulse_atr", "atr_pips",
 ]
 
 
 @dataclass
 class ZoneConfig:
-    # Strong move-out: leg-out range >= min_impulse_vs_base x the largest basing candle's range.
-    # None = off.
-    min_impulse_vs_base: float | None = 2.0
-    # Optional strength filter on the impulse: range >= legout_multiple x mean range of the
-    # previous legout_lookback candles. None = off (any close outside the previous range counts).
-    legout_multiple: float | None = None
-    legout_lookback: int = 10
-    # Base length. A run of basing candles longer than max_base_candles is not a base.
+    # Basing candle: body <= base_max_body_ratio of its range.
+    base_max_body_ratio: float = 0.5
     min_base_candles: int = 1
     max_base_candles: int = 5
-    # "Small" base candle: body <= base_max_body_ratio of its range and range <= base_max_atr x ATR.
-    base_max_body_ratio: float = 0.5
-    base_max_atr: float = 1.0
+    # Move-in / move-out candles close in the top (rally) or bottom (drop) close_zone of their range.
+    close_zone: float = 0.25
+    # Move-out range >= min_impulse_vs_base x the biggest basing candle (None = off), and taller
+    # than the move-in candle.
+    min_impulse_vs_base: float | None = 2.0
+    # Breakout: the impulse must close beyond the prior swing before price returns to the zone.
+    require_breakout: bool = True
+    swing_strength: int = 2
+    # Optional extra strength filter: move-out range >= legout_multiple x mean range of the previous
+    # legout_lookback candles. None = off.
+    legout_multiple: float | None = None
+    legout_lookback: int = 10
     atr_period: int = 14
 
 
@@ -67,61 +79,102 @@ def atr(df, period=14):
     return true_range.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
 
 
+def candle_direction(o, h, l, c, i, close_zone):
+    """'R' for a rally candle, 'D' for a drop candle, '' otherwise (see module docstring)."""
+    rng = h[i] - l[i]
+    if rng <= 0 or i == 0:
+        return ""
+    if c[i] > o[i] and c[i] >= h[i] - close_zone * rng and c[i] > h[i - 1]:
+        return "R"
+    if c[i] < o[i] and c[i] <= l[i] + close_zone * rng and c[i] < l[i - 1]:
+        return "D"
+    return ""
+
+
+def reference_swing(levels, swing_idx, base_start, strength, beyond, demand):
+    """Most recent swing (confirmed before the base) beyond the zone: above it for demand, below for supply."""
+    confirmed = swing_idx[swing_idx + strength < base_start]
+    for j in confirmed[::-1]:
+        if (levels[j] > beyond) if demand else (levels[j] < beyond):
+            return levels[j]
+    return None
+
+
 def detect_zones(df, config=None, pip=0.0001):
-    """Return a dataframe of zones (one per impulse candle), oldest first."""
+    """Return a dataframe of valid zones (one per move-out candle), oldest first.
+
+    `breakout_time` is the open time of the candle whose close made the breakout; NaT if the
+    breakout hasn't happened yet in this data (the zone isn't tradable yet).
+    """
     cfg = config or ZoneConfig()
     df = df.reset_index(drop=True)
     o, h, l, c = (df[col].to_numpy() for col in ("open", "high", "low", "close"))
     rng = h - l
-    body = abs(c - o)
-    body_ratio = np.divide(body, rng, out=np.zeros_like(rng), where=rng > 0)  # zero-range candles -> 0
+    body_ratio = np.divide(abs(c - o), rng, out=np.zeros_like(rng), where=rng > 0)
+    basing = body_ratio <= cfg.base_max_body_ratio
     atr_vals = atr(df, cfg.atr_period).to_numpy()
     avg_prev_range = pd.Series(rng).rolling(cfg.legout_lookback).mean().shift().to_numpy()
-    small = (body_ratio <= cfg.base_max_body_ratio) & (rng <= cfg.base_max_atr * atr_vals)
+    swings = find_swings(df, cfg.swing_strength)
+    swing_highs = np.flatnonzero(swings["swing_high"].to_numpy())
+    swing_lows = np.flatnonzero(swings["swing_low"].to_numpy())
 
     zones = []
-    first = max(cfg.legout_lookback, cfg.atr_period) + cfg.max_base_candles + 1
+    first = max(cfg.legout_lookback, cfg.atr_period) + cfg.max_base_candles + 2
     for i in range(first, len(df)):
-        if c[i] > h[i - 1]:
-            leg_out_dir = "R"
-        elif c[i] < l[i - 1]:
-            leg_out_dir = "D"
-        else:
-            continue  # closed inside the previous candle's range: not an impulse
-        if small[i]:
-            continue  # a basing candle can't be the impulse
-        if cfg.legout_multiple is not None and rng[i] < cfg.legout_multiple * avg_prev_range[i]:
+        out_dir = "" if basing[i] else candle_direction(o, h, l, c, i, cfg.close_zone)
+        if not out_dir:
             continue
 
         n = 0
-        while n < cfg.max_base_candles and small[i - 1 - n]:
+        while n < cfg.max_base_candles and basing[i - 1 - n]:
             n += 1
         leg_in = i - n - 1
-        if n < cfg.min_base_candles or small[leg_in]:
-            continue  # no base, or the consolidation runs longer than max_base_candles
-        if c[leg_in] > h[leg_in - 1]:
-            leg_in_dir = "R"
-        elif c[leg_in] < l[leg_in - 1]:
-            leg_in_dir = "D"
-        else:
-            continue  # the candle before the base isn't a move-in impulse
+        if n < cfg.min_base_candles or basing[leg_in]:
+            continue  # no base, or more than max_base_candles basing candles
+        in_dir = candle_direction(o, h, l, c, leg_in, cfg.close_zone)
+        if not in_dir:
+            continue  # the candle before the base isn't a move-in candle
 
         base = slice(i - n, i)
         biggest_base = rng[base].max()
         if cfg.min_impulse_vs_base is not None and rng[i] < cfg.min_impulse_vs_base * biggest_base:
-            continue  # move-out not strong enough
-        # Far edge (stop side) is always the base's wick extreme; the near (entry) edge is the
-        # wick for a single-candle base and the body for a multi-candle base.
+            continue
+        if rng[i] <= rng[leg_in]:
+            continue  # the move-out must be taller than the move-in
+        if cfg.legout_multiple is not None and rng[i] < cfg.legout_multiple * avg_prev_range[i]:
+            continue
+
+        demand = out_dir == "R"
         top, bottom = h[base].max(), l[base].min()
-        if n > 1 and leg_out_dir == "R":
+        if n > 1 and demand:
             top = max(o[base].max(), c[base].max())
         elif n > 1:
             bottom = min(o[base].min(), c[base].min())
+
+        breakout_time, level = pd.NaT, np.nan
+        if cfg.require_breakout:
+            ref = reference_swing(h if demand else l, swing_highs if demand else swing_lows, i - n,
+                                  cfg.swing_strength, top if demand else bottom, demand)
+            if ref is None:
+                continue  # nothing to break out of
+            level = ref
+            beyond = np.flatnonzero(c[i:] > ref if demand else c[i:] < ref)
+            k = i + beyond[0] if len(beyond) else len(df)
+            back = l[i + 1:k + 1] <= top if demand else h[i + 1:k + 1] >= bottom
+            if back.any():
+                continue  # price returned to the zone before the breakout: void
+            if k < len(df):
+                breakout_time = df["time"].iloc[k]
+        else:
+            breakout_time = df["time"].iloc[i]
+
         zones.append({
             "start_time": df["time"].iloc[i - n],
             "legout_time": df["time"].iloc[i],
-            "type": f"{leg_in_dir}B{leg_out_dir}",
-            "kind": "demand" if leg_out_dir == "R" else "supply",
+            "breakout_time": breakout_time,
+            "breakout_level": level,
+            "type": f"{in_dir}B{out_dir}",
+            "kind": "demand" if demand else "supply",
             "top": top,
             "bottom": bottom,
             "base_candles": n,
@@ -131,4 +184,6 @@ def detect_zones(df, config=None, pip=0.0001):
             "impulse_atr": round(rng[i] / atr_vals[i - 1], 2),
             "atr_pips": round(atr_vals[i - 1] / pip, 1),
         })
-    return pd.DataFrame(zones, columns=ZONE_COLUMNS)
+    out = pd.DataFrame(zones, columns=ZONE_COLUMNS)
+    out["breakout_time"] = pd.to_datetime(out["breakout_time"], utc=True)
+    return out
