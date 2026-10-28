@@ -56,9 +56,10 @@ class ZoneConfig:
     max_base_candles: int = 5
     # Move-in / move-out candles close in the top (rally) or bottom (drop) close_zone of their range.
     close_zone: float = 0.25
-    # Move-out range >= min_impulse_vs_base x the biggest basing candle (None = off), and taller
-    # than the move-in candle.
+    # Move-out range >= min_impulse_vs_base x the biggest basing candle (None = off), and (if
+    # move_out_taller_than_move_in) taller than the move-in candle.
     min_impulse_vs_base: float | None = 2.0
+    move_out_taller_than_move_in: bool = True
     # Breakout: the impulse must close beyond the prior swing before price returns to the zone.
     require_breakout: bool = True
     # Move away: price must travel min_move_away x the zone height from the entry edge (None = off).
@@ -147,7 +148,7 @@ def detect_zones(df, config=None, pip=0.0001):
         biggest_base = rng[base].max()
         if cfg.min_impulse_vs_base is not None and rng[i] < cfg.min_impulse_vs_base * biggest_base:
             continue
-        if rng[i] <= rng[leg_in]:
+        if cfg.move_out_taller_than_move_in and rng[i] <= rng[leg_in]:
             continue  # the move-out must be taller than the move-in
         if cfg.legout_multiple is not None and rng[i] < cfg.legout_multiple * avg_prev_range[i]:
             continue

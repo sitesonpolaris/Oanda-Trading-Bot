@@ -138,3 +138,76 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+def plot_lol(trade, market, pip, path):
+    """Chart one Level on Level Entry: downtrend swing broken, reversal zone, stacked entry zone, levels."""
+    bars = market.bars
+    long = trade.side == "long"
+    bos_idx = int(bars["time"].searchsorted(trade.bos_time))
+    rev_idx = int(bars["time"].searchsorted(trade.rev_start))
+    levels = bars["high"] if long else bars["low"]
+    swing_idx = max(i for i in range(rev_idx) if abs(levels.iat[i] - trade.bos_level) < 1e-9)
+    end = int(bars["time"].searchsorted(trade.exit_time if pd.notna(trade.exit_time) else trade.entry_time)) + AFTER
+    start = max(0, min(swing_idx, rev_idx) - 25)
+    w = bars.iloc[start:end + 1].reset_index(drop=True)
+    x = lambda t: int(w["time"].searchsorted(t))  # noqa: E731
+    n = len(w)
+
+    fig, ax = plt.subplots(figsize=(15, 7.5))
+    for k, r in w.iterrows():
+        color = "#26a69a" if r.close >= r.open else "#ef5350"
+        ax.vlines(k, r.low, r.high, color=color, linewidth=0.8)
+        ax.add_patch(Rectangle((k - 0.35, min(r.open, r.close)), 0.7, max(abs(r.close - r.open), 1e-9), color=color))
+
+    kind, opposite = ("demand", "supply") if long else ("supply", "demand")
+    if trade.target_source == "80% to zone":
+        zones = active_at(market.all_zones[market.all_zones["tf"] == "H1"], trade.entry_time)
+        col = "bottom" if long else "top"
+        tz = zones[(zones["kind"] == opposite) & (zones[col] == trade.target_zone_edge)].iloc[0]
+        x0 = max(0, x(tz.start_time))
+        ax.add_patch(Rectangle((x0 - 0.5, tz.bottom), n - x0, tz.top - tz.bottom, color=COLORS[opposite], alpha=0.22))
+        ax.text(x0, tz.top if long else tz.bottom, f" TARGET ZONE: {tz.type} {opposite}", color=COLORS[opposite],
+                fontsize=9, fontweight="bold", va="bottom" if long else "top")
+
+    xs, xb = swing_idx - start, bos_idx - start
+    ax.hlines(trade.bos_level, xs, xb + 0.5, colors="#6a1b9a", linewidth=1.5)
+    ax.plot([xs], [trade.bos_level], "o", color="#6a1b9a", markersize=8, fillstyle="none")
+    ax.text(xs, trade.bos_level, (" last lower high" if long else " last higher low"), color="#6a1b9a", fontsize=8,
+            va="bottom" if long else "top")
+    ax.annotate("BOS", (xb, trade.bos_level), xytext=(8, 14 if long else -18), textcoords="offset points",
+                color="#6a1b9a", fontsize=10, fontweight="bold", arrowprops={"arrowstyle": "->", "color": "#6a1b9a"})
+
+    for top, bottom, start_t, label, alpha in ((trade.rev_top, trade.rev_bottom, trade.rev_start,
+                                                f"{trade.rev_type} (reversal)", 0.15),
+                                               (trade.cont_top, trade.cont_bottom, trade.cont_start,
+                                                f"{trade.cont_type} ENTRY ZONE (level on level)", 0.35)):
+        x0 = x(start_t)
+        ax.add_patch(Rectangle((x0 - 0.5, bottom), n - x0, top - bottom, color=COLORS[kind], alpha=alpha))
+        ax.text(x0, bottom if long else top, f" {label}", color=COLORS[kind], fontsize=9, fontweight="bold",
+                va="top" if long else "bottom")
+
+    xo = x(trade.order_time)
+    for y, label, c in ((trade.entry, f"ENTRY {trade.entry:.5f}", "#1565c0"),
+                        (trade.stop, f"STOP LOSS {trade.stop:.5f}", "#c62828"),
+                        (trade.target, f"TAKE PROFIT {trade.target:.5f} ({trade.target_source})", "#2e7d32")):
+        ax.hlines(y, xo - 0.5, n - 0.5, colors=c, linestyles="--", linewidth=1.3)
+        ax.text(n - 1, y, label, color=c, fontsize=9, fontweight="bold", ha="right", va="bottom",
+                bbox={"facecolor": "white", "alpha": 0.7, "edgecolor": "none", "pad": 1})
+    if trade.status == "filled":
+        ax.plot([x(trade.entry_time)], [trade.fill_price], marker="^" if long else "v", color="#1565c0", markersize=12)
+        ax.plot([x(trade.exit_time)], [trade.exit_price], marker="X",
+                color="#2e7d32" if trade.result == "win" else "#c62828", markersize=12)
+
+    ticks = range(0, n, max(1, n // 12))
+    ax.set_xticks(list(ticks))
+    ax.set_xticklabels([w["time"].iat[t].strftime("%Y-%m-%d\n%H:%M") for t in ticks], fontsize=7)
+    ax.set_xlim(-1, n + 1)
+    outcome = f"{trade.result.upper()} {trade.r_multiple:+.2f}R" if trade.status == "filled" else trade.status
+    ax.set_title(f"{trade.instrument} H1 Level on Level Entry, {trade.side.upper()}: {trade.rev_type} breaks structure, "
+                 f"{trade.cont_type} stacked | risk {trade.risk_pips} pips, planned {trade.planned_rr}R | {outcome}",
+                 fontsize=10)
+    ax.grid(alpha=0.2)
+    fig.tight_layout()
+    fig.savefig(path, dpi=105)
+    plt.close(fig)
