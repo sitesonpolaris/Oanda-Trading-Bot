@@ -23,8 +23,10 @@ Long (short is the mirror image):
      Each setup records whether D1 and H4 agreed (`trend_aligned`), so aligned
      and countertrend setups can be compared.
   7. Target (when price comes back to the RBR): `target_fraction` (80%) of the
-     way to the nearest unbroken H1 supply zone above (touched is fine); if
-     there is none, the RBR's move-out distance (top of the RBR to the high
+     way to the first H1 supply zone above price found looking back (left) from
+     the RBR: the most recent one formed before the RBR that is still unbroken
+     when price returns (touched is fine). Target zones use the full course
+     rules (`zones`). If there is none, the RBR's move-out distance (top of the RBR to the high
      before the return) projected from the entry. Under `min_reward_risk`, no trade.
 
 Usage:
@@ -53,9 +55,9 @@ class LoLConfig:
     atr_buffer: float = 0.1          # fraction of the daily ATR
     min_reward_risk: float = 2.0
     spread_pips: float = 1.2
-    zones: ZoneConfig = field(default_factory=ZoneConfig)  # target zones: the full course rules
     # The DBR and the RBR don't need the move-out strength rules or the 2x move away: the break of
     # structure is the strength test.
+    zones: ZoneConfig = field(default_factory=ZoneConfig)  # target zones: the full course rules
     setup_zones: ZoneConfig = field(default_factory=lambda: ZoneConfig(
         require_breakout=False, min_impulse_vs_base=None, move_out_taller_than_move_in=False, min_move_away=None))
     # Most candles from the DBR's move-out to the start of the RBR's base (None = no limit).
@@ -159,14 +161,16 @@ def simulate(setups, market, cfg, pip):
         t = times.iat[f]
         opp = active_at(h1_zones, t)
         if long:
-            edges = opp.loc[(opp["kind"] == "supply") & (opp["bottom"] > entry), "bottom"]
+            beyond = opp[(opp["kind"] == "supply") & (opp["bottom"] > entry)]
         else:
-            edges = opp.loc[(opp["kind"] == "demand") & (opp["top"] < entry), "top"]
+            beyond = opp[(opp["kind"] == "demand") & (opp["top"] < entry)]
+        beyond = beyond[beyond["start_time"] < s.cont_start]  # up and to the left of the RBR
         legout = int(times.searchsorted(s.cont_legout))
-        if len(edges):
-            edge = edges.min() if long else edges.max()
+        if len(beyond):
+            tz = beyond.loc[beyond["start_time"].idxmax()]  # first one looking back from the entry
+            edge = tz.bottom if long else tz.top
             target, source = entry + cfg.target_fraction * (edge - entry), "80% to zone"
-            row["target_zone_edge"] = edge
+            row.update(target_zone_edge=edge, target_zone_start=tz.start_time, target_zone_type=tz.type)
         else:
             move = (h[legout:f].max() - entry) if long else (entry - l[legout:f].min())
             target, source = (entry + move if long else entry - move), "move-out distance"

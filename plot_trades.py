@@ -164,7 +164,8 @@ def plot_lol(trade, market, pip, path):
     if trade.target_source == "80% to zone":
         zones = active_at(market.all_zones[market.all_zones["tf"] == "H1"], trade.entry_time)
         col = "bottom" if long else "top"
-        tz = zones[(zones["kind"] == opposite) & (zones[col] == trade.target_zone_edge)].iloc[0]
+        tz = zones[(zones["kind"] == opposite) & (zones[col] == trade.target_zone_edge)
+                   & (zones["start_time"] == trade.target_zone_start)].iloc[0]
         x0 = max(0, x(tz.start_time))
         ax.add_patch(Rectangle((x0 - 0.5, tz.bottom), n - x0, tz.top - tz.bottom, color=COLORS[opposite], alpha=0.22))
         ax.text(x0, tz.top if long else tz.bottom, f" TARGET ZONE: {tz.type} {opposite}", color=COLORS[opposite],
