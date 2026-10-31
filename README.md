@@ -270,3 +270,21 @@ line (with reversals) instead of the dots and triangles.
 
 Results are per 1 unit, in points for the S&P 500 ($1 per point per unit) and
 pips for FX pairs. Data from the holdout date onwards is excluded.
+
+## Daily trend following (`trend/`)
+
+A 55-day breakout with a 20-day exit, 2-ATR stop and 0.25% risk per trade across
+21 FX pairs (max 5 positions, max 2 leaning on one currency), with spread,
+slippage and a flat 1.5%/year financing cost. Rules and the pass mark were
+committed before the first run: profit factor >= 1.3 and worst drawdown < 8% on
+the development data, then one holdout run.
+
+```bash
+python -m fetch_candles --instrument EUR_USD --granularity D --years 21   # per pair
+python -m trend.backtest
+```
+
+Result of the single development run (Nov 2005 - Apr 2026): **FAIL**. Profit
+factor 0.71, worst drawdown 43.5%, -1.9% a year; 0.84 even with no costs. It made
+money in 2008 and has lost slowly almost every year since 2011. The holdout was
+not run.
