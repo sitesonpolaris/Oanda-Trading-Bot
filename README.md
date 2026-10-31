@@ -239,3 +239,30 @@ in `state/`. Settings live in `BotConfig` in `bot.py`.
 pip install -r requirements-dev.txt
 python -m pytest
 ```
+
+## Daily Anchored VWAP strategy (`vwap/`)
+
+A separate strategy, ported from the RoboQuant "Daily Anchored VWAP Signal
+Strategy" with the `MES_3min.set` inputs. It's backtest only and shares nothing
+with the zone bot. See `vwap/strategy.py` for the rules.
+
+OANDA has no MES futures, so the test uses OANDA's S&P 500 CFD (`SPX500_USD`)
+as a stand-in, plus FX pairs. OANDA volume is a tick count, so the VWAP is an
+approximation of the exchange VWAP.
+
+```bash
+python -m vwap.fetch --instruments SPX500_USD EUR_USD --years 3   # 1-minute bid/ask candles
+python -m vwap.backtest                                           # SPX500_USD and EUR_USD
+python -m vwap.backtest --instruments SPX500_USD --ema-length 20  # any input can be overridden
+```
+
+Changes from the RoboQuant code, as agreed:
+- Every position closes at the 16:00 ET bar's close, and no new entries are
+  taken on or after it. (The original has no stop and no session-end exit.)
+- Orders fill at the next 3-minute bar's open, buying at the ask and selling at
+  the bid, so OANDA's spread is the trading cost.
+- The VWAP restarts at midnight ET, as in the original. Bars are stamped with
+  their close time.
+
+Results are per 1 unit, in points for the S&P 500 ($1 per point per unit) and
+pips for FX pairs. Data from the holdout date onwards is excluded.
