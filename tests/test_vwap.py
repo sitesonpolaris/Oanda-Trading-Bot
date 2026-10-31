@@ -75,3 +75,19 @@ def test_daily_rules_hold_on_random_prices():
         assert len(day) <= 1 + FAST.additional_attempts
         if day["pnl"].iat[0] > 0:
             assert len(day) == 1  # first trade won: done for the day
+
+
+def test_crossover_mode_reverses_after_a_loss_and_stops_after_a_win():
+    from dataclasses import replace
+    p = replace(FAST, anchor="ema", ema_length=2, slow_ema_length=6, signal_mode="crossover")
+    losing = bars_from_closes([100.0] * 12 + [101, 101.5, 100.5, 98, 96, 95, 98, 101, 103, 104])  # long, cross down, cross up
+    trades, _ = run(losing, p)
+    first, second = trades.iloc[0], trades.iloc[1]
+    assert (first.side, second.side) == (1, -1) and first.pnl < 0
+    assert first.exit_reason == "green_triangle" and second.entry_time == first.exit_time  # reversed at one open
+    assert first.exit_price == second.entry_price == losing.loc[losing["time"] == first.exit_time, "bid_open"].iat[0]
+
+    winning = bars_from_closes([100.0] * 12 + [102, 104, 106, 106, 106, 103, 100, 97, 97])
+    trades, signals = run(winning, p)
+    assert len(trades) == 1 and trades["pnl"].iat[0] > 0  # first trade won: no reversal, done for the day
+    assert (signals["signal"] == "red_dot").any()

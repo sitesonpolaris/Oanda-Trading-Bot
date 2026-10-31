@@ -35,6 +35,10 @@ Trading:
     exit fills at the session-end bar's close. An ATR stop fills at the stop, or
     at the open if the bar gaps through it.
 
+Variants (not in the RoboQuant strategy): `anchor="ema"` replaces VWAP with a slow
+EMA of the close (`slow_ema_length`) everywhere above; `signal_mode="crossover"`
+replaces the dots and triangles with the EMA crossing the anchor line (see VwapParams).
+
 Bars are stamped with their close time: the 15:57-16:00 bar is the 16:00 bar.
 """
 
@@ -63,6 +67,13 @@ class VwapParams:
     # Not in the RoboQuant strategy:
     close_at_session_end: bool = True
     bar_minutes: int = 3
+    # The line the EMA is compared with: "vwap" (the original) or "ema" (a slow EMA of the close).
+    anchor: str = "vwap"
+    slow_ema_length: int = 50
+    # "dots": the RoboQuant signals. "crossover": the EMA crossing the anchor line is the signal;
+    # a cross up is a green dot and closes a short, a cross down a red dot and closes a long, and an
+    # opposite cross reverses the position (same attempts and filters).
+    signal_mode: str = "dots"
 
 
 def resample(m1, minutes=3):
@@ -103,10 +114,19 @@ def indicators(bars, p):
     cum_pv = (price * vol).groupby(df["et_date"]).cumsum()
     cum_v = vol.groupby(df["et_date"]).cumsum()
     df["vwap"] = (cum_pv / cum_v).where(cum_v > 0)
-    df["ema"] = df["close"].ewm(span=max(p.ema_length, 1), adjust=False, min_periods=max(p.ema_length, 1)).mean()
+    df["ema"] = ema(df["close"], p.ema_length)
+    if p.anchor == "ema":  # the anchor line replaces VWAP everywhere ("vwap" below means the anchor)
+        df["vwap"] = ema(df["close"], p.slow_ema_length)
+    elif p.anchor != "vwap":
+        raise ValueError(f"anchor must be 'vwap' or 'ema', not {p.anchor!r}")
     df["atr"] = wilder_atr(df, max(p.atr_period, 1))
     df["baseline_atr"] = wilder_atr(df, max(p.baseline_atr_period, 2))
     return df
+
+
+def ema(series, length):
+    length = max(length, 1)
+    return series.ewm(span=length, adjust=False, min_periods=length).mean()
 
 
 def in_session(hhmm, p):
@@ -127,12 +147,14 @@ def run(bars, p=None):
     day = None
     regime = 0
     waiting_red = waiting_green = has_prev = False
-    prev_close = prev_vwap = np.nan
+    prev_close = prev_vwap = prev_ema = np.nan
+    if p.signal_mode not in ("dots", "crossover"):
+        raise ValueError(f"signal_mode must be 'dots' or 'crossover', not {p.signal_mode!r}")
     first_closed = first_won = False
     attempts = 0
     position = 0            # +1 long, -1 short (filled or pending fill at the next open)
     entry = None            # dict for the open trade
-    pending = None          # ("enter", side, reason, stop) or ("exit", reason) to fill at the next open
+    pending = None          # ("enter", side, reason, stop) or ("exit", reason, then_enter) for the next open
     trades, signals = [], []
 
     def close_trade(k, price, reason):
@@ -146,14 +168,18 @@ def run(bars, p=None):
         position, entry = 0, None
 
     for k in range(n):
-        # 1. Fill whatever was ordered at the previous bar's close, at this bar's open.
+        # 1. Fill whatever was ordered at the previous bar's close, at this bar's open. A reversal
+        #    closes first, then enters if the day's attempts still allow it.
+        if pending is not None and entry is not None and pending[0] == "exit":
+            close_trade(k, cols["bid_open"][k] if entry["side"] > 0 else cols["ask_open"][k], pending[1])
+            allowed = not first_closed or (not first_won and attempts < p.additional_attempts)
+            pending = pending[2] if allowed else None
+            position = pending[1] if pending is not None else 0
         if pending is not None and entry is None and pending[0] == "enter":
             _, side, reason, stop_dist = pending
             price = cols["ask_open"][k] if side > 0 else cols["bid_open"][k]
             entry = {"side": side, "entry_time": times[k], "entry_price": price, "entry_reason": reason,
                      "stop": price - side * stop_dist if stop_dist else np.nan}
-        elif pending is not None and entry is not None and pending[0] == "exit":
-            close_trade(k, cols["bid_open"][k] if entry["side"] > 0 else cols["ask_open"][k], pending[1])
         pending = None
 
         # 2. ATR stop during the bar.
@@ -178,7 +204,12 @@ def run(bars, p=None):
         vol_ok = not p.use_relative_volatility_filter or atr / base <= max(p.max_relative_atr, 0.1)
         hhmm = cols["et_hhmm"][k]
         red_dot = green_dot = red_tri = green_tri = pullback = False
-        if in_session(hhmm, p):
+        if in_session(hhmm, p) and p.signal_mode == "crossover":
+            if has_prev and prev_ema <= prev_vwap and ema > vwap:
+                green_dot = red_tri = True
+            elif has_prev and prev_ema >= prev_vwap and ema < vwap:
+                red_dot = green_tri = True
+        elif in_session(hhmm, p):
             if waiting_red and close > ema:
                 waiting_red, regime, red_tri = False, -2, True
             elif waiting_green and close < ema:
@@ -206,15 +237,18 @@ def run(bars, p=None):
         end_minutes = p.session_end_hhmm // 100 * 60 + p.session_end_hhmm % 100
         after_end = closes_at_end and hhmm >= p.session_end_hhmm
         last_entry_bar = closes_at_end and hhmm // 100 * 60 + hhmm % 100 >= end_minutes - p.bar_minutes
-        if (green_dot or red_dot) and allowed and vol_ok and position == 0 and not last_entry_bar and k + 1 < n:
+        order = None
+        if (green_dot or red_dot) and vol_ok and not last_entry_bar and k + 1 < n:
             side = 1 if green_dot else -1
             stop_dist = atr * max(p.atr_stop_multiplier, 0.1) if p.use_atr_stop else 0.0
             reason = ("green_dot" if green_dot else "red_dot") + ("_pullback" if pullback else "")
-            pending, position = ("enter", side, reason, stop_dist), side
+            order = ("enter", side, reason, stop_dist)
+        if order is not None and allowed and position == 0:
+            pending, position = order, order[1]
         elif green_tri and position > 0 and entry is not None and k + 1 < n:
-            pending = ("exit", "green_triangle")
+            pending = ("exit", "green_triangle", order)
         elif red_tri and position < 0 and entry is not None and k + 1 < n:
-            pending = ("exit", "red_triangle")
+            pending = ("exit", "red_triangle", order)
 
         # Session end: flat at this bar's close, and any unfilled order is dropped.
         if after_end:
@@ -222,7 +256,7 @@ def run(bars, p=None):
                 close_trade(k, cols["bid_close"][k] if entry["side"] > 0 else cols["ask_close"][k], "session_end")
             pending, position = None, 0
 
-        prev_close, prev_vwap, has_prev = close, vwap, True
+        prev_close, prev_vwap, prev_ema, has_prev = close, vwap, ema, True
 
     trade_df = pd.DataFrame(trades)
     if len(trade_df):

@@ -264,5 +264,9 @@ Changes from the RoboQuant code, as agreed:
 - The VWAP restarts at midnight ET, as in the original. Bars are stamped with
   their close time.
 
+Variants: `--anchor ema --slow-ema-length 34` compares the EMA with a slow EMA
+instead of VWAP; `--signal-mode crossover` trades the EMA crossing the anchor
+line (with reversals) instead of the dots and triangles.
+
 Results are per 1 unit, in points for the S&P 500 ($1 per point per unit) and
 pips for FX pairs. Data from the holdout date onwards is excluded.
