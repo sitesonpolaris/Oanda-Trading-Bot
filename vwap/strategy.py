@@ -27,7 +27,9 @@ Trading:
   - Attempts: if the day's first trade wins, no more trades that day; if it loses,
     up to `additional_attempts` more.
   - Exits: the matching triangle, the optional ATR stop, and (added here) every
-    position closes at the session end. No new entries on the session-end bar.
+    position closes at the session end. No entry that would fill on the
+    session-end bar. A pullback dot (steps 5-6) arms no triangle, so those trades
+    close at the session end unless a later dot arms one.
   - Orders are sent at a bar's close and fill at the next bar's open (buys at the
     ask, sells at the bid), so the spread is the trading cost. The session-end
     exit fills at the session-end bar's close. An ATR stop fills at the stop, or
@@ -175,7 +177,7 @@ def run(bars, p=None):
             continue
         vol_ok = not p.use_relative_volatility_filter or atr / base <= max(p.max_relative_atr, 0.1)
         hhmm = cols["et_hhmm"][k]
-        red_dot = green_dot = red_tri = green_tri = False
+        red_dot = green_dot = red_tri = green_tri = pullback = False
         if in_session(hhmm, p):
             if waiting_red and close > ema:
                 waiting_red, regime, red_tri = False, -2, True
@@ -186,9 +188,9 @@ def run(bars, p=None):
             elif regime == 2 and ema < vwap:
                 regime = 3
             elif regime == -3 and has_prev and prev_close >= prev_vwap and close < vwap:
-                regime, green_dot = 0, True
+                regime, green_dot, pullback = 0, True, True
             elif regime == 3 and has_prev and prev_close <= prev_vwap and close > vwap:
-                regime, red_dot = 0, True
+                regime, red_dot, pullback = 0, True, True
             elif regime == 0:
                 if ema < vwap and close < ema:
                     waiting_red, regime, red_dot = True, -1, True
@@ -200,12 +202,15 @@ def run(bars, p=None):
                 signals.append({"time": times[k], "signal": name, "close": close, "vwap": vwap, "ema": ema})
 
         allowed = not first_closed or (not first_won and attempts < p.additional_attempts)
-        after_end = (p.close_at_session_end and p.session_start_hhmm <= p.session_end_hhmm
-                     and hhmm >= p.session_end_hhmm)
-        if (green_dot or red_dot) and allowed and vol_ok and position == 0 and not after_end and k + 1 < n:
+        closes_at_end = p.close_at_session_end and p.session_start_hhmm <= p.session_end_hhmm
+        end_minutes = p.session_end_hhmm // 100 * 60 + p.session_end_hhmm % 100
+        after_end = closes_at_end and hhmm >= p.session_end_hhmm
+        last_entry_bar = closes_at_end and hhmm // 100 * 60 + hhmm % 100 >= end_minutes - p.bar_minutes
+        if (green_dot or red_dot) and allowed and vol_ok and position == 0 and not last_entry_bar and k + 1 < n:
             side = 1 if green_dot else -1
             stop_dist = atr * max(p.atr_stop_multiplier, 0.1) if p.use_atr_stop else 0.0
-            pending, position = ("enter", side, "green_dot" if green_dot else "red_dot", stop_dist), side
+            reason = ("green_dot" if green_dot else "red_dot") + ("_pullback" if pullback else "")
+            pending, position = ("enter", side, reason, stop_dist), side
         elif green_tri and position > 0 and entry is not None and k + 1 < n:
             pending = ("exit", "green_triangle")
         elif red_tri and position < 0 and entry is not None and k + 1 < n:
